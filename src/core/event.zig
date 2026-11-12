@@ -168,6 +168,10 @@ pub const Event = union(enum) {
     voice_status: struct { status: VoiceStatus, channel: Id = 0 },
     /// Alguém começou/parou de falar na call (o anel verde).
     voice_speaking: struct { user: Id, speaking: bool },
+    /// Alguém começou/parou de transmitir vídeo na call (ssrc 0 = parou).
+    voice_video: struct { user: Id, video_ssrc: u32, active: bool },
+    /// O stream (Go Live) que estávamos assistindo acabou.
+    stream_ended: Id,
     /// Ping do gateway de voz (o heartbeat dá o RTT).
     voice_ping: u32,
     /// O microfone ou a saída da call abriram? (a barra de voz avisa)
@@ -268,7 +272,11 @@ pub const VoiceFlags = packed struct(u8) {
     mute: bool = false,
     deaf: bool = false,
     suppress: bool = false,
-    _pad: u3 = 0,
+    /// `self_stream`: está transmitindo pelo Go Live (servidor de stream à parte).
+    stream: bool = false,
+    /// `self_video`: câmera ligada (vídeo na própria conexão de voz).
+    camera: bool = false,
+    _pad: u1 = 0,
 
     pub fn serverMuted(f: VoiceFlags) bool {
         return f.mute or f.suppress;
@@ -348,6 +356,8 @@ pub const Command = union(enum) {
     typing: Id,
     /// Entrar (channel != null) ou sair da call.
     join_voice: struct { guild: Id, channel: ?Id, mute: bool = false, deaf: bool = false },
+    /// Assistir ao Go Live de alguém (0 = parar). Usa a call de voz atual.
+    watch_stream: Id,
     /// Mudou mudo/ensurdecer com a call já conectada.
     voice_flags: struct { mute: bool, deaf: bool },
     /// Volume individual de quem está falando (0..2).
@@ -478,6 +488,8 @@ pub const Action = union(enum) {
     set_voice_mute: struct { user: Id, mute: bool },
     /// Abre/fecha o mixer de voz (a lista de quem está na call com volumes).
     toggle_voice_mixer,
+    /// Assiste ao vídeo de alguém (0 = fecha o visualizador).
+    watch_stream: Id,
     /// Call na DM ou grupo: começa (ou entra na que já existe), atende e
     /// recusa a que está tocando.
     start_call: Id,

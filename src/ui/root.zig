@@ -96,6 +96,12 @@ fn hidden(ctx: *d.Ctx, name: []const u8) bool {
     return false;
 }
 
+fn unionRect(a: d.Rect, b: d.Rect) d.Rect {
+    const x = @min(a.x, b.x);
+    const y = @min(a.y, b.y);
+    return .{ .x = x, .y = y, .w = @max(a.right(), b.right()) - x, .h = @max(a.bottom(), b.bottom()) - y };
+}
+
 pub fn frame(ctx: *d.Ctx, placed: *std.ArrayList(layout.Placed), previews: []const Preview) void {
     const vp = c.ImGui_GetMainViewport();
     c.ImGui_SetNextWindowPos(vp.*.Pos, 0);
@@ -105,6 +111,19 @@ pub fn frame(ctx: *d.Ctx, placed: *std.ArrayList(layout.Placed), previews: []con
         c.ImGuiWindowFlags_NoBackground | c.ImGuiWindowFlags_NoScrollWithMouse | c.ImGuiWindowFlags_NoNav);
     ctx.dl = c.ImGui_GetWindowDrawList();
     ctx.fg = c.ImGui_GetForegroundDrawList();
+    // Enquanto o vídeo está aberto (e nada mais por cima), não desenha a
+    // interface inteira atrás dele: sobra o orçamento do quadro para o vídeo.
+    const video_only = ctx.st.stream_open and !ctx.st.settings.open and ctx.st.popup == .none and
+        !ctx.st.palette.open and ctx.st.viewer == null;
+    if (video_only) {
+        d.rect(ctx.dl, ctx.win, ctx.col(.bg), 0);
+        c.ImGui_End();
+        @import("stream.zig").overlay(ctx);
+        @import("chamada.zig").overlay(ctx);
+        toast(ctx);
+        shortcuts(ctx);
+        return;
+    }
     const rich = @import("rich.zig");
     rich.frame_ctx = ctx;
     rich.emoji_images = @import("emoji_img.zig").enabled(ctx);
@@ -113,6 +132,11 @@ pub fn frame(ctx: *d.Ctx, placed: *std.ArrayList(layout.Placed), previews: []con
 
     d.opt_theme = ctx.th;
     fx.beginFrame();
+    // Entrar num canal de voz toma a área do chat: a grade da chamada entra
+    // no lugar das mensagens e da lista de membros, como no cliente oficial.
+    // Escolher uma conversa na lista lateral devolve o chat.
+    const call = ctx.st.call_view and ctx.st.voice != null and !ctx.st.stream_open and !ctx.st.settings.open;
+    var call_area: ?d.Rect = null;
     if (ctx.th.layout) |root| {
         const Look = struct {
             fn get(p: *const anyopaque, name: []const u8) ?bool {
@@ -155,6 +179,13 @@ pub fn frame(ctx: *d.Ctx, placed: *std.ArrayList(layout.Placed), previews: []con
             // Primitivas novas no próprio nó (gradiente, grão, borda por lado…).
             if (base_theme.nodeFx(p.node)) |x| fx.node(ctx, x, p.node, p.rect, i);
             if (p.kind != .component or hidden(ctx, p.node.name)) continue;
+            if (call and (std.mem.eql(u8, p.node.name, "messages") or
+                std.mem.eql(u8, p.node.name, "composer") or
+                std.mem.eql(u8, p.node.name, "member-list")))
+            {
+                call_area = if (call_area) |a| unionRect(a, p.rect) else p.rect;
+                continue;
+            }
             c.ImGui_PushIDPtr(p.node);
             defer c.ImGui_PopID();
             const inner = p.rect.inset(d.pnum(p.node, "inset-x", 0), d.pnum(p.node, "inset-y", 0));
@@ -168,6 +199,7 @@ pub fn frame(ctx: *d.Ctx, placed: *std.ArrayList(layout.Placed), previews: []con
         }
     }
     // Por cima dos painéis, por baixo do que flutua (a lista do autocompletar).
+    if (call) if (call_area) |a| @import("stream.zig").embedded(ctx, a);
     resize.submit(ctx);
     plugin_panel.draw(ctx);
     @import("lsp_ui.zig").panel(ctx);
@@ -184,6 +216,8 @@ pub fn frame(ctx: *d.Ctx, placed: *std.ArrayList(layout.Placed), previews: []con
     palette.draw(ctx);
     search.draw(ctx);
     toast(ctx);
+    // Vídeo assistido na call (fica abaixo do aviso de chamada).
+    @import("stream.zig").overlay(ctx);
     // Chamada chegando: por cima de tudo, em qualquer tema.
     @import("chamada.zig").overlay(ctx);
     shortcuts(ctx);

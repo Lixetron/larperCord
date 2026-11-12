@@ -78,6 +78,9 @@ The official client is a whole browser dressed up as an app. On the same PC:
   Accept and Decline, a ringtone (silent in Do Not Disturb or a muted conversation), a system notification
   and a taskbar flash, even from the tray. Right-click the mic or headphone button to switch devices
   mid-call; `Ctrl+Shift+M` mutes and `Ctrl+Shift+D` deafens.
+- **Watching a stream**: a "LIVE" badge marks whoever is on camera or sharing their screen with Go
+  Live (DMs, groups and servers); click it to watch (a double click or the corner button goes full
+  screen). H.264 through FFmpeg; sharing your own screen is next.
 - **Discord interactions**: right-click menus on messages, users, channels and servers;
   a hover action bar; **replies** (with the little curve and a click that jumps to the
   original); **edit** (`↑` in the empty box edits your last one); **delete**; **reactions**;

@@ -551,6 +551,8 @@ pub const Gateway = struct {
             g.commands.waitDrain(&cmds, wait);
             for (cmds.items) |cmd| switch (cmd) {
                 .shutdown => return,
+                // A demonstração não tem servidor de stream; o QA usa o padrão local.
+                .watch_stream => {},
                 .send_message => |m| {
                     // O corpo que iria para o Discord (o QA confere flags,
                     // menções, spoiler e texto alternativo).

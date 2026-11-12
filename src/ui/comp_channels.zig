@@ -110,7 +110,7 @@ pub fn channelList(ctx: *d.Ctx, n: *const kdl.Node, r_in: d.Rect) void {
         r.h -= hh;
     }
 
-    if (ctx.st.voice != null) r.h -= voiceBarHeight(variant == .tree);
+    if (ctx.st.voice != null) r.h -= voiceBarHeight(ctx, variant == .tree);
     const dl = d.beginRegion(ctx, "##channels", r, c.ImGuiWindowFlags_NoScrollbar);
     banner_scroll = if (banner_img) c.ImGui_GetScrollY() else 0;
     const o = c.ImGui_GetCursorScreenPos();
@@ -363,13 +363,19 @@ fn row(ctx: *d.Ctx, dl: *c.ImDrawList, fam: *d.Family, variant: Variant, cs: any
             if (vf.muted()) qa.mark(vr, "voice-flagged:{d}", .{uid});
             if (voiceFlagsTip(vf)) |vt| d.tip(ctx, vr, vt, vh.hovered);
             if (vh.hovered and variant != .tree) d.rect(dl, vr, ctx.col(.hover), ctx.th.radius);
-            if (vh.clicked) ctx.popup(.{ .profile = .{ .user = uid, .x = vr.right() + 8, .y = vr.y } });
+            const live = ctx.st.streamOf(uid) != null or vf.stream or vf.camera;
+            // Clicar em quem está na call abre o perfil; se a pessoa está
+            // transmitindo, abre o vídeo (o perfil fica no botão direito).
+            if (vh.clicked) {
+                if (live) ctx.act(.{ .watch_stream = uid }) else ctx.popup(.{ .profile = .{ .user = uid, .x = vr.right() + 8, .y = vr.y } });
+            }
             if (vh.right) ctx.popup(.{ .menu = .{ .kind = .user, .id = uid, .x = ctx.mouse.x, .y = ctx.mouse.y } });
             switch (variant) {
                 .tree => {
                     var buf: [80]u8 = undefined;
                     const t = std.fmt.bufPrint(&buf, "{s}   {s} {s}{s}{s}", .{ if (last) " " else "│", if (speaking) "◉" else "○", u.name, w.botSuffix(u), voiceFlagsTty(vf) }) catch u.name;
                     d.text(dl, fam.get(.regular), fs - 2, rr.x + 4, y2 + 2, if (speaking) ctx.col(.online) else ctx.col(.muted), t);
+                    if (live) liveBadge(ctx, dl, fam, rr.right() - 4, y2 + 10);
                     y2 += 20;
                 },
                 else => {
@@ -378,6 +384,7 @@ fn row(ctx: *d.Ctx, dl: *c.ImDrawList, fam: *d.Family, variant: Variant, cs: any
                     if (speaking) c.ImDrawList_AddCircleEx(dl, d.v(ax, acy), 12.5, ctx.col(.online).u(), 0, 2, 0);
                     w.avatar(ctx, dl, ax, acy, 21, uid, .circle, null, 1);
                     const icons_w = voiceFlagIcons(ctx, dl, vf, vr.right() - 6, acy);
+                    if (live) liveBadge(ctx, dl, fam, vr.right() - 6 - icons_w, acy);
                     const vn = d.textClipped(dl, fam.get(.medium), 14, ax + 18, acy - 9, if (speaking) ctx.col(.text) else ctx.col(.muted), u.name, vr.right() - (ax + 18) - icons_w - 6 - w.botTagSpace(ctx, u, false));
                     _ = w.botTag(ctx, dl, ax + 18 + vn, acy, u, false, 1);
                     y2 += 28;
@@ -425,6 +432,17 @@ fn voiceFlagIcons(ctx: *d.Ctx, dl: *c.ImDrawList, f: ev.VoiceFlags, right: f32, 
     return right - x;
 }
 
+/// Selo vermelho de quem está transmitindo vídeo na lista da call.
+fn liveBadge(ctx: *d.Ctx, dl: *c.ImDrawList, fam: *d.Family, right: f32, cy: f32) void {
+    const bw: f32 = 30;
+    const r: d.Rect = .{ .x = right - bw - 2, .y = cy - 6.5, .w = bw, .h = 13 };
+    d.rect(dl, r, ctx.col(.danger), 3);
+    const f = fam.get(.bold);
+    const t = "LIVE";
+    d.text(dl, f, 8, r.x + (r.w - d.width(f, 8, t)) / 2, r.y + 2.5, d.Rgba.white, t);
+    qa.mark(r, "voice-live", .{});
+}
+
 /// Ícone do painel com o risco de "desligado" por cima.
 fn smallIcon(dl: *c.ImDrawList, kind: enum { mic, headset }, cx: f32, cy: f32, col: d.Rgba) void {
     switch (kind) {
@@ -443,6 +461,7 @@ fn voiceFlagsTty(f: ev.VoiceFlags) []const u8 {
 }
 
 fn voiceFlagsTip(f: ev.VoiceFlags) ?[]const u8 {
+    if (f.stream) return i18n.tr("Transmitindo ao vivo (Go Live)", "Streaming live (Go Live)");
     if (f.deaf) return i18n.tr("Surdo pelo servidor", "Server deafened");
     if (f.serverMuted()) return i18n.tr("Mudo pelo servidor", "Server muted");
     if (f.self_deaf) return i18n.tr("Ensurdeceu", "Deafened");
@@ -476,7 +495,7 @@ pub fn userPanel(ctx: *d.Ctx, n: *const kdl.Node, r: d.Rect) void {
     // Em call: a faixa de voz fica logo acima do painel (a lista de canais
     // deixa esse espaço livre), sem empurrar o nome para fora da tela.
     if (ctx.st.voice) |vc| {
-        const vh = voiceBarHeight(tty);
+        const vh = voiceBarHeight(ctx, tty);
         const vr: d.Rect = .{ .x = r.x, .y = r.y - vh, .w = r.w, .h = vh };
         d.rect(ctx.dl, vr, ctx.col(.sidebar).mix(ctx.col(.rail), 0.35), 0);
         voicePanel(ctx, fam, vr, vc, tty);
@@ -603,8 +622,11 @@ fn modeLine(ctx: *d.Ctx, buf: []u8) ?[]const u8 {
 }
 
 /// Altura da faixa "Voz conectada" (a lista de canais reserva esse espaço).
-pub fn voiceBarHeight(tty: bool) f32 {
-    return if (tty) 40 else 74;
+/// Com alguém transmitindo, ganha uma linha para o botão LIVE.
+pub fn voiceBarHeight(ctx: *d.Ctx, tty: bool) f32 {
+    if (tty) return 40;
+    const vc = ctx.st.voice orelse return 74;
+    return if (streamerOf(ctx, vc) != null) 96 else 74;
 }
 
 /// O que dizer na última linha da faixa de voz: um problema (em vermelho), ou
@@ -659,10 +681,33 @@ fn signalBars(ctx: *d.Ctx, x: f32, bottom: f32, q: voz.Quality, col: d.Rgba) voi
     }
 }
 
+/// Quem está transmitindo na call (Go Live ou câmera), se alguém estiver.
+fn streamerOf(ctx: *d.Ctx, vc: Id) ?Id {
+    const cs = ctx.store.channel(vc) orelse return null;
+    for (cs.voice_members.items) |uid| {
+        if (ctx.st.streamOf(uid) != null) return uid;
+        const vf = ctx.store.voiceFlags(uid);
+        if (vf.stream or vf.camera) return uid;
+    }
+    return null;
+}
+
 fn voicePanel(ctx: *d.Ctx, fam: *d.Family, r: d.Rect, vc: Id, tty: bool) void {
     const cs = ctx.store.channel(vc) orelse return;
     const g = ctx.store.guild(cs.info.guild);
     const connected = ctx.st.voice_status == .connected;
+    // Quem está transmitindo (Go Live ou câmera): uma linha LIVE na faixa.
+    if (!tty) if (streamerOf(ctx, vc)) |uid| {
+        const lr: d.Rect = .{ .x = r.x + 8, .y = r.y + 49, .w = r.w - 16, .h = 17 };
+        const lh = d.hitRaw(ctx, lr);
+        qa.mark(lr, "voice-live:{d}", .{uid});
+        d.rect(ctx.dl, lr, ctx.col(.danger).alpha(0.92), 4);
+        var lb: [96]u8 = undefined;
+        const label = if (ctx.store.user(uid)) |u| std.fmt.bufPrint(&lb, "● LIVE — {s}", .{u.name}) catch "● LIVE" else "● LIVE";
+        _ = d.textClipped(ctx.dl, fam.get(.bold), 10, lr.x + 7, lr.y + 3, d.Rgba.white, label, lr.w - 12);
+        d.tip(ctx, lr, i18n.tr("Assistir ao stream", "Watch the stream"), lh.hovered);
+        if (lh.clicked) ctx.act(.{ .watch_stream = uid });
+    };
     const ping = ctx.st.voice_ping_ms;
     const q = voz.qualityOf(ping);
     const qcol = switch (q) {
@@ -834,7 +879,7 @@ fn dmList(ctx: *d.Ctx, n: *const kdl.Node, fam: *d.Family, variant: Variant, r_i
         r.y += hh;
         r.h -= hh;
     }
-    if (ctx.st.voice != null) r.h -= voiceBarHeight(tree);
+    if (ctx.st.voice != null) r.h -= voiceBarHeight(ctx, tree);
     const dl = d.beginRegion(ctx, "##dms", r, c.ImGuiWindowFlags_NoScrollbar);
     const o = c.ImGui_GetCursorScreenPos();
     var y = o.y + 10;

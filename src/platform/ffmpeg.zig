@@ -61,6 +61,7 @@ pub const Api = struct {
     av_get_pix_fmt: *const fn ([*:0]const u8) callconv(.c) c_int,
 
     avcodec_version: *const fn () callconv(.c) c_uint,
+    avcodec_find_decoder_by_name: *const fn ([*:0]const u8) callconv(.c) ?*const Codec,
     avcodec_alloc_context3: *const fn (?*const Codec) callconv(.c) ?*CodecCtx,
     avcodec_free_context: *const fn (*?*CodecCtx) callconv(.c) void,
     avcodec_parameters_to_context: *const fn (*CodecCtx, *const anyopaque) callconv(.c) c_int,
@@ -72,6 +73,7 @@ pub const Api = struct {
     av_packet_free: *const fn (*?*Packet) callconv(.c) void,
     av_packet_unref: *const fn (*Packet) callconv(.c) void,
     av_packet_move_ref: *const fn (*Packet, *Packet) callconv(.c) void,
+    av_packet_from_data: *const fn (*Packet, [*]u8, c_int) callconv(.c) c_int,
 
     avformat_version: *const fn () callconv(.c) c_uint,
     avformat_alloc_context: *const fn () callconv(.c) ?*FormatCtx,
@@ -497,7 +499,7 @@ pub fn frameHeight(f: *Frame) c_int {
 fn frameSamples(f: *Frame) c_int {
     return field(c_int, f, 112).*;
 }
-fn frameFormat(f: *Frame) c_int {
+pub fn frameFormat(f: *Frame) c_int {
     return field(c_int, f, 116).*;
 }
 fn framePts(f: *Frame) i64 {
@@ -701,21 +703,7 @@ pub const Media = struct {
     /// `rgbaSize(dw, dh)` bytes: as conversões em SIMD do swscale escrevem
     /// alguns pixels além do fim da linha quando a largura não é múltipla de 8.
     pub fn toRgba(m: *Media, dst: []u8, dw: u32, dh: u32) bool {
-        const a = m.api;
-        const f = m.frame.?;
-        if (dst.len < rgbaSize(dw, dh)) return false;
-        const key = [5]c_int{ frameWidth(f), frameHeight(f), frameFormat(f), @intCast(dw), @intCast(dh) };
-        if (key[0] <= 0 or key[1] <= 0 or key[0] > 8192 or key[1] > 8192) return false;
-        if (m.sws == null or !std.mem.eql(c_int, &key, &m.sws_key)) {
-            if (m.sws) |s| a.sws_freeContext(s);
-            m.sws = a.sws_getContext(key[0], key[1], key[2], key[3], key[4], rgba_fmt, sws_bilinear, null, null, null);
-            m.sws_key = key;
-        }
-        const s = m.sws orelse return false;
-        const planes: [4]?[*]u8 = .{ dst.ptr, null, null, null };
-        const strides: [4]c_int = .{ @intCast(dw * 4), 0, 0, 0 };
-        const src: *const [8]?[*]const u8 = @ptrCast(frameData(f));
-        return a.sws_scale(s, src, frameLinesize(f), 0, key[1], &planes, &strides) > 0;
+        return scaleToRgba(m.api, m.frame.?, &m.sws, &m.sws_key, dst, dw, dh);
     }
 
     /// Decodifica um pacote de áudio e entrega cada quadro como f32
@@ -741,6 +729,103 @@ pub const Media = struct {
 pub fn rgbaSize(dw: u32, dh: u32) usize {
     return @as(usize, dw) * dh * 4 + 256;
 }
+
+/// O swscale de um quadro para RGBA, com o contexto guardado entre chamadas.
+fn scaleToRgba(a: *const Api, f: *Frame, sws: *?*Sws, key_out: *[5]c_int, dst: []u8, dw: u32, dh: u32) bool {
+    if (dst.len < rgbaSize(dw, dh)) return false;
+    const key = [5]c_int{ frameWidth(f), frameHeight(f), frameFormat(f), @intCast(dw), @intCast(dh) };
+    if (key[0] <= 0 or key[1] <= 0 or key[0] > 8192 or key[1] > 8192) return false;
+    if (sws.* == null or !std.mem.eql(c_int, &key, key_out)) {
+        if (sws.*) |s| a.sws_freeContext(s);
+        sws.* = a.sws_getContext(key[0], key[1], key[2], key[3], key[4], rgba_fmt, sws_bilinear, null, null, null);
+        key_out.* = key;
+    }
+    const s = sws.* orelse return false;
+    const planes: [4]?[*]u8 = .{ dst.ptr, null, null, null };
+    const strides: [4]c_int = .{ @intCast(dw * 4), 0, 0, 0 };
+    const src: *const [8]?[*]const u8 = @ptrCast(frameData(f));
+    return a.sws_scale(s, src, frameLinesize(f), 0, key[1], &planes, &strides) > 0;
+}
+
+/// Decodificador de H.264 cru: os quadros chegam do RTP em Annex-B, sem
+/// contêiner. Um por pessoa assistida, tocado numa thread só.
+pub const Raw = struct {
+    api: *const Api,
+    ctx: ?*CodecCtx = null,
+    frame: ?*Frame = null,
+    pkt: ?*Packet = null,
+    sws: ?*Sws = null,
+    sws_key: [5]c_int = @splat(0),
+
+    pub fn open(a: *const Api, threads: i64) !Raw {
+        const codec = a.avcodec_find_decoder_by_name("h264") orelse return error.NoCodec;
+        var r: Raw = .{ .api = a };
+        errdefer r.close();
+        r.ctx = a.avcodec_alloc_context3(codec) orelse return error.NoMem;
+        _ = a.av_opt_set_int(r.ctx.?, "threads", @max(1, threads), 0);
+        // Quadros e/ou fatias em paralelo (FF_THREAD_FRAME | FF_THREAD_SLICE).
+        // O H.264 do Discord costuma vir com 1 fatia só; o frame threading é o
+        // que segura 1080p60. Custa alguns quadros de latência, o que para
+        // assistir não aparece.
+        _ = a.av_opt_set_int(r.ctx.?, "thread_type", 3, 0);
+        if (a.avcodec_open2(r.ctx.?, codec, null) < 0) return error.Codec;
+        r.frame = a.av_frame_alloc() orelse return error.NoMem;
+        r.pkt = a.av_packet_alloc() orelse return error.NoMem;
+        return r;
+    }
+
+    pub fn close(r: *Raw) void {
+        const a = r.api;
+        if (r.ctx != null) a.avcodec_free_context(&r.ctx);
+        if (r.frame != null) a.av_frame_free(&r.frame);
+        if (r.pkt != null) a.av_packet_free(&r.pkt);
+        if (r.sws) |s| a.sws_freeContext(s);
+        r.sws = null;
+    }
+
+    /// Manda um quadro Annex-B. Falso = o decodificador não aceitou.
+    pub fn send(r: *Raw, frame: []const u8) bool {
+        if (frame.len == 0 or frame.len > max_raw_frame) return false;
+        const a = r.api;
+        // O FFmpeg lê até AV_INPUT_BUFFER_PADDING_SIZE além do fim (SIMD).
+        const pad: usize = 64;
+        const buf: [*]u8 = @ptrCast(a.av_malloc(frame.len + pad) orelse return false);
+        @memset(buf[frame.len..][0..pad], 0);
+        @memcpy(buf[0..frame.len], frame);
+        if (a.av_packet_from_data(r.pkt.?, buf, @intCast(frame.len)) < 0) {
+            a.av_free(buf);
+            return false;
+        }
+        const rc = a.avcodec_send_packet(r.ctx.?, r.pkt.?);
+        a.av_packet_unref(r.pkt.?);
+        return rc >= 0;
+    }
+
+    pub fn receive(r: *Raw) c_int {
+        return r.api.avcodec_receive_frame(r.ctx.?, r.frame.?);
+    }
+
+    /// Fim do fluxo: manda o pacote nulo para o frame threading liberar o que
+    /// ficou em atraso (nos testes e no encerramento).
+    pub fn drain(r: *Raw) void {
+        _ = r.api.avcodec_send_packet(r.ctx.?, null);
+    }
+
+    pub fn flush(r: *Raw) void {
+        r.api.avcodec_flush_buffers(r.ctx.?);
+    }
+
+    pub fn size(r: *const Raw) [2]u32 {
+        const f = r.frame.?;
+        return .{ @intCast(@max(0, frameWidth(f))), @intCast(@max(0, frameHeight(f))) };
+    }
+
+    pub fn toRgba(r: *Raw, dst: []u8, dw: u32, dh: u32) bool {
+        return scaleToRgba(r.api, r.frame.?, &r.sws, &r.sws_key, dst, dw, dh);
+    }
+};
+
+const max_raw_frame: usize = 8 << 20;
 
 fn openCodec(a: *const Api, codec: *const Codec, s: *Stream, threads: i64) !*CodecCtx {
     var ctx: ?*CodecCtx = a.avcodec_alloc_context3(codec) orelse return error.NoMem;

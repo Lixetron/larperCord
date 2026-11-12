@@ -74,6 +74,29 @@ const client_state_json =
     \\{"guild_hashes":{},"highest_last_message_id":"0","read_state_version":0,"user_guild_settings_version":-1,"user_settings_version":-1}
 ;
 
+/// Um Go Live que estamos assistindo: o que o Stream Create/Server Update
+/// trouxe e a conexão RTC própria (separada da call).
+const PendingStream = struct {
+    active: bool = false,
+    owner: Id = 0,
+    key: [160]u8 = @splat(0),
+    key_len: usize = 0,
+    token: [256]u8 = @splat(0),
+    token_len: usize = 0,
+    endpoint: [256]u8 = @splat(0),
+    endpoint_len: usize = 0,
+    server_id: Id = 0,
+    channel_id: Id = 0,
+    have_create: bool = false,
+    have_server: bool = false,
+    worker: ?*voice_mod.Voice = null,
+    wait_until: i64 = 0,
+
+    fn keySlice(s: *const PendingStream) []const u8 {
+        return s.key[0..s.key_len];
+    }
+};
+
 pub const Gateway = struct {
     commands: Queue(ev.Command),
     sink: Sink,
@@ -118,6 +141,8 @@ pub const Gateway = struct {
     voice_wait_until: i64 = 0,
     /// Alguém nos moveu de canal há pouco: uma queda agora pede o canal de novo.
     voice_moved: voz_movido.Movido = .{},
+    /// Go Live assistido (conexão de stream separada).
+    stream: PendingStream = .{},
     /// Status escolhido (também vai no IDENTIFY de uma sessão nova).
     status: types.Status = .online,
     /// Status personalizado e o resto da conta (net/conta_net.zig).
@@ -555,6 +580,7 @@ pub const Gateway = struct {
             g.flushAcks();
             if (g.stopping) return .reconnect;
             g.voiceTick();
+            g.streamTick();
             if (g.ws_end) |e| return e;
 
             // Dorme até chegar algo no socket, um comando ou o próximo
@@ -1480,10 +1506,12 @@ pub const Gateway = struct {
         if (std.mem.eql(u8, t, "VOICE_STATE_UPDATE")) {
             const user = j.id(j.get(d, "user_id")) orelse return;
             const chan = j.id(j.get(d, "channel_id"));
-            g.emit(.{ .voice_state = .{ .channel = chan, .user = user, .flags = voiceFlagsOf(d) } });
+            const vf = voiceFlagsOf(d);
+            g.emit(.{ .voice_state = .{ .channel = chan, .user = user, .flags = vf } });
+            // Quem transmitia parou (ou saiu): fecha o Go Live que assistimos.
+            if (user != g.me and g.stream.active and g.stream.owner == user and !vf.stream) g.stopStream();
             if (user == g.me) {
                 if (g.voice_unconfirmed) |v| {
-                    const vf = voiceFlagsOf(d);
                     if (v.confirmedBy(chan, vf.self_mute, vf.self_deaf)) g.voice_unconfirmed = null;
                 }
                 if (j.str(j.get(d, "session_id"))) |sid| {
@@ -1547,6 +1575,48 @@ pub const Gateway = struct {
             return;
         }
         // Calls de DM e grupo: quem está tocando e quem já está na call.
+        if (std.mem.eql(u8, t, "STREAM_CREATE")) {
+            const key = j.str(j.get(d, "stream_key")) orelse return;
+            if (!std.mem.eql(u8, key, g.stream.keySlice())) return;
+            g.stream.server_id = j.id(j.get(d, "rtc_server_id")) orelse 0;
+            g.stream.channel_id = j.id(j.get(d, "rtc_channel_id")) orelse 0;
+            g.stream.have_create = true;
+            g.startStreamWorker();
+            return;
+        }
+        if (std.mem.eql(u8, t, "STREAM_SERVER_UPDATE")) {
+            const key = j.str(j.get(d, "stream_key")) orelse return;
+            if (!std.mem.eql(u8, key, g.stream.keySlice())) return;
+            const ep = j.str(j.get(d, "endpoint")) orelse "";
+            g.stopStreamWorker();
+            g.stream.endpoint_len = 0;
+            g.stream.token_len = 0;
+            g.stream.have_server = false;
+            if (ep.len == 0) {
+                // Servidor realocado: espera outro Stream Server Update.
+                g.stream.wait_until = nowMs() + 10_000;
+                return;
+            }
+            g.stream.endpoint_len = @min(ep.len, g.stream.endpoint.len - 1);
+            @memcpy(g.stream.endpoint[0..g.stream.endpoint_len], ep[0..g.stream.endpoint_len]);
+            if (j.str(j.get(d, "token"))) |tk| {
+                g.stream.token_len = @min(tk.len, g.stream.token.len - 1);
+                @memcpy(g.stream.token[0..g.stream.token_len], tk[0..g.stream.token_len]);
+            }
+            g.stream.have_server = true;
+            g.startStreamWorker();
+            return;
+        }
+        if (std.mem.eql(u8, t, "STREAM_UPDATE")) {
+            const key = j.str(j.get(d, "stream_key")) orelse return;
+            if (!std.mem.eql(u8, key, g.stream.keySlice())) return;
+            return;
+        }
+        if (std.mem.eql(u8, t, "STREAM_DELETE")) {
+            const key = j.str(j.get(d, "stream_key")) orelse return;
+            if (std.mem.eql(u8, key, g.stream.keySlice())) g.stopStream();
+            return;
+        }
         if (std.mem.eql(u8, t, "CALL_CREATE") or std.mem.eql(u8, t, "CALL_UPDATE") or std.mem.eql(u8, t, "CALL_DELETE")) {
             const ended = std.mem.eql(u8, t, "CALL_DELETE");
             const cl = call_json.parse(d, g.me, ended) orelse return;
@@ -2849,7 +2919,7 @@ pub const Gateway = struct {
     /// Comando que é escrito no WebSocket (não passa pelo REST).
     fn usesGateway(cmd: ev.Command) bool {
         return switch (cmd) {
-            .subscribe_guild, .channel_info, .set_status, .set_activity, .join_voice, .voice_flags => true,
+            .subscribe_guild, .channel_info, .set_status, .set_activity, .join_voice, .voice_flags, .watch_stream => true,
             // Os eventos da interação vão para a sessão do READY (session_id).
             .interaction => |ic| ic == .send,
             else => false,
@@ -3608,6 +3678,8 @@ pub const Gateway = struct {
             .mute = on(vs, "mute"),
             .deaf = on(vs, "deaf"),
             .suppress = on(vs, "suppress"),
+            .stream = on(vs, "self_stream"),
+            .camera = on(vs, "self_video"),
         };
     }
 
@@ -3658,8 +3730,96 @@ pub const Gateway = struct {
         g.voice_wait_until = 0;
     }
 
+    /// Op 20: pede para assistir ao Go Live de alguém na call em que estamos.
+    fn watchStream(g: *Gateway, user: Id) void {
+        if (user == 0) return g.stopStream();
+        // A grade manda a prévia a cada quadro; o mesmo stream já conectado não
+        // gasta outro op 20 (o teto do gateway é de 128 por minuto).
+        if (g.stream.active and g.stream.owner == user) return;
+        if (g.voice_channel == 0) return;
+        g.stopStream();
+        g.stream.active = true;
+        g.stream.owner = user;
+        const key = call_json.streamKey(&g.stream.key, g.voice_guild, g.voice_channel, user) orelse return;
+        g.stream.key_len = key.len;
+        var out: [256]u8 = undefined;
+        const p = std.fmt.bufPrint(&out, "{{\"op\":20,\"d\":{{\"stream_key\":\"{s}\"}}}}", .{key}) catch return;
+        std.log.debug("stream: op20 {s}", .{key});
+        g.send(p);
+        g.stream.wait_until = nowMs() + 10_000;
+    }
+
+    fn stopStreamWorker(g: *Gateway) void {
+        if (g.stream.worker) |vc| {
+            vc.stop();
+            vc.deinit();
+            alloc.destroy(vc);
+            g.stream.worker = null;
+        }
+    }
+
+    /// Op 19: para de assistir; o espectador sai da conexão de stream.
+    fn stopStream(g: *Gateway) void {
+        const owner = g.stream.owner;
+        if (g.stream.key_len > 0) {
+            var out: [256]u8 = undefined;
+            const p = std.fmt.bufPrint(&out, "{{\"op\":19,\"d\":{{\"stream_key\":\"{s}\"}}}}", .{g.stream.keySlice()}) catch "";
+            if (p.len > 0) g.send(p);
+            std.log.debug("stream: op19 {s}", .{g.stream.keySlice()});
+        }
+        g.stopStreamWorker();
+        g.stream = .{};
+        if (owner != 0) g.emit(.{ .stream_ended = owner });
+    }
+
+    /// As duas metades (Stream Create e Stream Server Update) chegaram: abre a
+    /// conexão RTC do stream. O DAVE usa o `media_session_id` como grupo.
+    fn startStreamWorker(g: *Gateway) void {
+        if (g.stream.worker != null or !g.stream.active) return;
+        if (!g.stream.have_create or !g.stream.have_server or g.stream.endpoint_len == 0) return;
+        if (g.stream.server_id == 0 or g.stream.channel_id == 0) return;
+        const vc = alloc.create(voice_mod.Voice) catch return;
+        const group = g.stream.server_id -% 1;
+        vc.* = voice_mod.Voice.initStream(
+            g.sink,
+            g.me,
+            g.stream.server_id,
+            g.stream.channel_id,
+            group,
+            g.stream.endpoint[0..g.stream.endpoint_len],
+            g.stream.token[0..g.stream.token_len],
+            g.voice_session[0..g.voice_session_len],
+        );
+        g.stream.wait_until = 0;
+        vc.start() catch {
+            vc.deinit();
+            alloc.destroy(vc);
+            const owner = g.stream.owner;
+            g.stream = .{};
+            if (owner != 0) g.emit(.{ .stream_ended = owner });
+            return;
+        };
+        g.stream.worker = vc;
+        std.log.debug("stream: conexão aberta (ssrc próprio) para {d}", .{g.stream.owner});
+    }
+
+    /// A thread do stream terminou sozinha (queda, servidor trocado): fecha a
+    /// janela e esquece o stream.
+    fn streamTick(g: *Gateway) void {
+        if (g.stream.worker) |vc| switch (vc.ended.load(.acquire)) {
+            .running => {},
+            else => return g.stopStream(),
+        };
+        if (g.stream.active and g.stream.worker == null and g.stream.wait_until != 0 and nowMs() >= g.stream.wait_until) {
+            g.stopStream();
+        }
+    }
+
+
     /// Para a thread de voz mas guarda o que precisa para abrir de novo.
     fn killVoice(g: *Gateway) void {
+        // O Go Live é outra conexão: se a call caiu, o stream também acaba.
+        g.stopStream();
         if (g.voice) |vc| {
             vc.stop();
             vc.deinit();
@@ -4377,6 +4537,12 @@ pub const Gateway = struct {
                     g.voice_token_len = 0;
                     if (g.me != 0) g.sendVoiceState(ch);
                 } else {
+                    // Sair da call não pode esperar o teto: o resto da fila é
+                    // descartado para o op 4 sair agora.
+                    if (g.me != 0 and !g.outbox.budget.allows(nowMs())) {
+                        g.outbox.clear();
+                        g.outbox.budget.reset();
+                    }
                     if (g.me != 0) g.sendVoiceState(null);
                     g.stopVoice();
                     g.voice_channel = 0;
@@ -4391,6 +4557,9 @@ pub const Gateway = struct {
             .voice_volume => |v| {
                 g.voice_volumes.put(alloc, v.user, std.math.clamp(v.volume, 0, 2)) catch {};
                 if (g.voice) |vc| vc.setVolume(v.user, v.volume);
+            },
+            .watch_stream => |u| {
+                if (u == 0) g.stopStream() else g.watchStream(u);
             },
             .call_ring => |ch| {
                 const path = std.fmt.bufPrint(&path_buf, "/channels/{d}/call/ring", .{ch}) catch return;

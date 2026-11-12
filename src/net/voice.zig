@@ -35,6 +35,8 @@ const call_json = @import("call_json.zig");
 const web = @import("web_client.zig");
 const voz = @import("../core/voz.zig");
 const voz_audio = @import("voz_audio.zig");
+const voz_video = @import("voz_video.zig");
+const video_rtp = @import("../core/video_rtp.zig");
 
 const Id = types.Id;
 const alloc = std.heap.c_allocator;
@@ -48,11 +50,24 @@ const frame_bytes = frame_samples * channels * @sizeOf(i16); // 3840
 const bytes_per_ms = opus_rate * channels * @sizeOf(i16) / 1000; // 192
 const silence = [_]u8{ 0xF8, 0xFF, 0xFE };
 
+/// Payload types que propomos no Select Protocol. O 96 é reservado para as
+/// sondas do servidor; os nossos podem ser qualquer outro.
+const opus_pt: u8 = 120;
+
+/// Remontagem de um SSRC de vídeo assistido (a grade pode ter vários).
+const DepSlot = struct { ssrc: u32 = 0, dep: video_rtp.Depacketizer = .{} };
+
 fn queuedMs(st: *c.SDL_AudioStream) u32 {
     return @intCast(@divTrunc(@max(c.SDL_GetAudioStreamQueued(st), 0), bytes_per_ms));
 }
 
 var debug_on = false;
+/// Chaves para o A/B do feedback (LARPER_VIDEO_NO_FB / _NO_CC / _NO_RR /
+/// _NO_REMB): se o bitrate do remetente cair por causa do que mandamos, dá
+/// para isolar qual relatório é o culpado.
+var fb_cc = true;
+var fb_rr = true;
+var fb_remb = true;
 
 fn debugOn() bool {
     return debug_on or @import("../platform/debug_log.zig").isOn();
@@ -75,9 +90,18 @@ pub const Ended = enum(u8) {
     moved,
 };
 
+pub const Kind = enum { voice, stream };
+
 pub const Voice = struct {
     sink: Sink,
+    /// `stream` = espectador de um Go Live: outra conexão RTC, só recebe.
+    kind: Kind = .voice,
     guild: Id = 0,
+    /// O que vai no IDENTIFY (numa DM é o canal; num stream, o `rtc_server_id`).
+    ident_server: Id = 0,
+    ident_channel: Id = 0,
+    /// Grupo do MLS do DAVE (o canal numa call; `media_session_id` num stream).
+    dave_group: Id = 0,
     /// Muda quando alguém nos move de canal (o grupo do DAVE é o canal).
     channel: sys.Atomic(Id) = .init(0),
     user: Id = 0,
@@ -98,9 +122,18 @@ pub const Voice = struct {
     volumes_gen: std.atomic.Value(u32) = .init(0),
     /// Sem rede: só o microfone e a detecção de voz (a demonstração).
     local: bool = false,
+    /// Segura uma referência do hub de vídeo (para o `stop` não soltar duas).
+    video_ref: bool = false,
 
     pub fn init(sink: Sink, guild: Id, channel: Id, user: Id, endpoint: []const u8, token: []const u8, session: []const u8, mute: bool, deaf: bool) Voice {
-        var v: Voice = .{ .sink = sink, .guild = guild, .user = user };
+        var v: Voice = .{
+            .sink = sink,
+            .guild = guild,
+            .user = user,
+            .ident_server = call_json.serverId(guild, channel),
+            .ident_channel = channel,
+            .dave_group = channel,
+        };
         v.channel = .init(channel);
         v.endpoint_len = @min(endpoint.len, v.endpoint.len - 1);
         @memcpy(v.endpoint[0..v.endpoint_len], endpoint[0..v.endpoint_len]);
@@ -114,9 +147,42 @@ pub const Voice = struct {
         return v;
     }
 
+    /// Espectador de um Go Live: conexão própria, com o servidor/canal do
+    /// Stream Create e o grupo DAVE = `media_session_id` (rtc_server_id - 1).
+    pub fn initStream(sink: Sink, user: Id, server_id: Id, channel_id: Id, dave_group: Id, endpoint: []const u8, token: []const u8, session: []const u8) Voice {
+        var v: Voice = .{
+            .sink = sink,
+            .kind = .stream,
+            .user = user,
+            .ident_server = server_id,
+            .ident_channel = channel_id,
+            .dave_group = dave_group,
+        };
+        v.channel = .init(channel_id);
+        v.endpoint_len = @min(endpoint.len, v.endpoint.len - 1);
+        @memcpy(v.endpoint[0..v.endpoint_len], endpoint[0..v.endpoint_len]);
+        v.token_len = @min(token.len, v.token.len - 1);
+        @memcpy(v.token[0..v.token_len], token[0..v.token_len]);
+        v.session_len = @min(session.len, v.session.len - 1);
+        @memcpy(v.session[0..v.session_len], session[0..v.session_len]);
+        v.muted = .init(true);
+        v.volume_mutex = c.SDL_CreateMutex();
+        return v;
+    }
+
     pub fn start(v: *Voice) !void {
         debug_on = c.SDL_getenv("LARPER_VOICE_DEBUG") != null;
-        v.thread = c.SDL_CreateThread(threadMain, "voice", v) orelse return error.SdlThread;
+        const all_off = c.SDL_getenv("LARPER_VIDEO_NO_FB") != null;
+        fb_cc = !all_off and c.SDL_getenv("LARPER_VIDEO_NO_CC") == null;
+        fb_rr = !all_off and c.SDL_getenv("LARPER_VIDEO_NO_RR") == null;
+        fb_remb = !all_off and c.SDL_getenv("LARPER_VIDEO_NO_REMB") == null;
+        voz_video.start();
+        v.video_ref = true;
+        v.thread = c.SDL_CreateThread(threadMain, "voice", v) orelse {
+            voz_video.stop();
+            v.video_ref = false;
+            return error.SdlThread;
+        };
     }
 
     pub fn stop(v: *Voice) void {
@@ -124,6 +190,11 @@ pub const Voice = struct {
         if (v.thread) |t| {
             c.SDL_WaitThread(t, null);
             v.thread = null;
+        }
+        // Só depois da thread de voz: ninguém mais empurra quadro.
+        if (v.video_ref) {
+            voz_video.stop();
+            v.video_ref = false;
         }
     }
 
@@ -167,6 +238,8 @@ pub const Voice = struct {
     }
 
     fn status(v: *Voice, st: ev.VoiceStatus) void {
+        // A conexão de stream não é a call: o painel de voz não muda com ela.
+        if (v.kind == .stream) return;
         v.emit(.{ .voice_status = .{ .status = st, .channel = v.channel.load(.acquire) } });
     }
 
@@ -233,6 +306,76 @@ const Worker = struct {
     /// aqui e entram no DAVE quando ele nasce.
     call_users: std.AutoHashMapUnmanaged(Id, void) = .empty,
     call_ssrcs: std.AutoHashMapUnmanaged(u32, Id) = .empty,
+    /// De quem é cada vídeo anunciado (op 12): usuário → SSRC do stream.
+    video_users: std.AutoHashMapUnmanaged(Id, u32) = .empty,
+    /// Remontagem do H.264 de cada SSRC assistido (grade da call).
+    deps: [voz_video.max_watch]DepSlot = @splat(.{}),
+    /// Buffer do DAVE em vídeo (o quadro inteiro, que o de áudio não comporta).
+    video_plain: std.ArrayList(u8) = .empty,
+    /// Os SSRCs que já pedimos ao servidor (op 15), na ordem enviada.
+    subs: [voz_video.max_watch]u32 = @splat(0),
+    n_sub: usize = 0,
+    /// Último PLI (pedido de quadro-chave), para não repetir a cada tique.
+    last_pli_ms: i64 = 0,
+    /// Qualidade pedida ao SFU; cai sozinha se o vídeo não acompanhar.
+    video_quality: u8 = 100,
+    qcheck_ms: i64 = 0,
+    qframes: u64 = 0,
+    qshown: u64 = 0,
+    /// Janelas seguidas ruins/boas e o começo da medição de qualidade (ms).
+    qbad: u8 = 0,
+    qgood: u8 = 0,
+    qwarm_ms: i64 = 0,
+    qb_bytes: u64 = 0,
+    /// Sequência estendida do SSRC assistido, para o RTCP Receiver Report.
+    v_last_seq: u16 = 0,
+    v_cycle: u16 = 0,
+    v_ext_seq: u32 = 0,
+    v_have_seq: bool = false,
+    rtcp_ms: i64 = 0,
+    remb_ms: i64 = 0,
+    /// Jitter RFC 3550 (1/90000 s) e o último Sender Report do SFU (RTT).
+    v_jit: f64 = 0,
+    v_jit_ts: u32 = 0,
+    v_jit_arr_us: u64 = 0,
+    v_jit_have: bool = false,
+    sr_lsr: u32 = 0,
+    sr_ms: i64 = 0,
+    /// Pacotes de vídeo do SSRC assistido (para a taxa de perda no log).
+    v_pkts: u64 = 0,
+    v_stat_ms: i64 = 0,
+    v_stat_frames: u64 = 0,
+    v_stat_unique: u64 = 0,
+    v_stat_bytes: u64 = 0,
+    v_stat_pkts: u64 = 0,
+    v_stat_seq: u32 = 0,
+    /// Amostras de chegada do transport-cc, enviadas em lote a cada ~50 ms.
+    cc_samples: [192]video_rtp.CcSample = undefined,
+    cc_n: usize = 0,
+    cc_media: u32 = 0,
+    cc_next_ms: i64 = 0,
+    cc_pkt: u8 = 0,
+    /// Maior intervalo entre dois quadros completos na janela do log (ms).
+    v_last_frame_ms: i64 = 0,
+    v_gap_max: i64 = 0,
+    /// Quantos intervalos caíram em <20, <40, <80 e 80+ ms.
+    v_gap_hist: [4]u32 = .{ 0, 0, 0, 0 },
+    /// Quadros-chave completos na janela do log.
+    v_keys: u32 = 0,
+    /// Último tamanho de fonte visto (para registrar quando o stream muda de
+    /// resolução sem trocar de SSRC).
+    v_src_w: u32 = 0,
+    v_src_h: u32 = 0,
+    /// SSRCs de vídeo que chegaram sem serem o assistido (camadas/simulcast).
+    v_seen: [8]u32 = @splat(0),
+    /// RTP ts do quadro anterior: o menor intervalo entre quadros dá o fps
+    /// nominal do encoder; os intervalos grandes (saltos) mostram quadros que
+    /// não chegaram até nós.
+    v_last_ts: u32 = 0,
+    v_have_ts: bool = false,
+    v_ts_min: u32 = 0xffff_ffff,
+    v_ts_big: u32 = 0,
+    cc_missing: bool = false,
     encoder: ?*c.OpusEncoder = null,
     // Áudio.
     audio_on: bool = false,
@@ -344,7 +487,7 @@ const Worker = struct {
         if (std.mem.startsWith(u8, ep, "wss://")) ep = ep[6..];
         if (std.mem.startsWith(u8, ep, "https://")) ep = ep[8..];
         if (ep.len == 0) return null;
-        return std.fmt.bufPrintSentinel(&w.url_buf, "wss://{s}/?v=8", .{ep}, 0) catch null;
+        return std.fmt.bufPrintSentinel(&w.url_buf, "wss://{s}/?v=9", .{ep}, 0) catch null;
     }
 
     fn connectWs(w: *Worker, url: [:0]const u8) bool {
@@ -402,6 +545,9 @@ const Worker = struct {
         w.ws_in.deinit(alloc);
         w.call_users.deinit(alloc);
         w.call_ssrcs.deinit(alloc);
+        w.video_users.deinit(alloc);
+        for (&w.deps) |*slot| slot.dep.deinit(alloc);
+        w.video_plain.deinit(alloc);
     }
 
     fn addCallUser(w: *Worker, uid: Id) void {
@@ -458,12 +604,150 @@ const Worker = struct {
         w.applyAudioFlags();
         w.audioPoll(now);
         if (!w.connected) return;
+        // A interface pode ter escolhido outro stream: o servidor precisa saber.
+        w.syncWatch(false);
+        // Perdemos um quadro e o decodificador está parado: pede outro
+        // quadro-chave de vez em quando (o SFU também manda por conta dele).
+        if (w.n_sub > 0 and (voz_video.status() == .stalled or w.deps[0].dep.need_key) and now - w.last_pli_ms >= 1000) {
+            w.sendPli(w.primary());
+            w.last_pli_ms = now;
+        }
+        // Vídeo pesado demais (1440p num CPU fraco): pede uma qualidade menor
+        // ao SFU, que ajusta resolução/bitrate do encoder. Duas janelas ruins
+        // seguidas para descer — o começo do stream (flush, keyframe) não conta
+        // — e volta a subir quando o decodificador se recupera.
+        if (w.n_sub == 0) {
+            w.qcheck_ms = 0;
+            w.qbad = 0;
+            w.qgood = 0;
+        } else {
+            const st = voz_video.stats();
+            if (w.qcheck_ms == 0) {
+                w.qcheck_ms = now;
+                w.qwarm_ms = now;
+                w.qframes = st.frames;
+                w.qshown = st.shown;
+                w.qb_bytes = st.bytes;
+                w.qbad = 0;
+                w.qgood = 0;
+            } else if (now - w.qcheck_ms >= 2000) {
+                const dt: u64 = @intCast(@max(now - w.qcheck_ms, 1));
+                const dec = (st.frames - w.qframes) * 1000 / dt;
+                const shown = (st.shown - w.qshown) * 1000 / dt;
+                const mbps_in = @as(f64, @floatFromInt(st.bytes - w.qb_bytes)) * 8 / @as(f64, @floatFromInt(dt)) / 1000;
+                w.qcheck_ms = now;
+                w.qframes = st.frames;
+                w.qshown = st.shown;
+                w.qb_bytes = st.bytes;
+                const src = voz_video.sourceSize();
+                // Nos primeiros segundos o decodificador enche o buffer e o SFU
+                // sobe o bitrate: medir aí só produzia queda sem motivo. E só
+                // desce se o bitrate que chega for alto: com o SFU já mandando
+                // pouco, baixar a qualidade só piora.
+                const warm = now - w.qwarm_ms < 5000;
+                const heavy = !warm and dec > 0 and dec < 26 and (src[0] > 1280 or src[1] > 720) and mbps_in > 3.0;
+                const stall = !warm and shown > 0 and shown < 26 and dec >= 40;
+                if (heavy or stall) {
+                    w.qgood = 0;
+                    w.qbad +|= 1;
+                    if (w.qbad >= 2 and w.video_quality > 40) {
+                        w.video_quality -= 20;
+                        w.sendSinkWants();
+                        dbg("vídeo a {d} dec/{d} exib ({d:.1} Mbps): pedindo qualidade {d}", .{ dec, shown, mbps_in, w.video_quality });
+                        w.qbad = 0;
+                    }
+                } else {
+                    w.qbad = 0;
+                    if (dec >= 50 and w.video_quality < 100) {
+                        w.qgood +|= 1;
+                        if (w.qgood >= 3) {
+                            w.video_quality = @min(100, w.video_quality + 20);
+                            w.sendSinkWants();
+                            dbg("vídeo a {d} dec/{d} exib: voltando à qualidade {d}", .{ dec, shown, w.video_quality });
+                            w.qgood = 0;
+                        }
+                    } else {
+                        w.qgood = 0;
+                    }
+                }
+            }
+        }
+        // Transport-cc em lote (um RTCP a cada 50 ms, como o Chrome).
+        if (w.n_sub > 0 and fb_cc and now >= w.cc_next_ms) {
+            w.flushTransportCc(now);
+            w.cc_next_ms = now + 50;
+        }
+        // Frequência de recepção (1 Hz) para o SFU estimar o canal.
+        if (w.n_sub > 0 and w.v_have_seq and now - w.rtcp_ms >= 1000) {
+            w.sendRtcpRr(w.primary());
+            w.rtcp_ms = now;
+        }
+        // REMB (2 Hz de sobra): 6 Mbps de teto para o encoder não se apertar.
+        if (w.n_sub > 0 and now - w.remb_ms >= 2000) {
+            w.sendRemb(w.primary(), 6_000_000);
+            w.remb_ms = now;
+        }
+        // Diagnóstico do que chega: fps, quadros novos, bitrate e perda. É o
+        // que distingue "o encoder manda pouco" de "perdemos pacotes".
+        if (debugOn() and w.n_sub > 0) {
+            const st = voz_video.stats();
+            // O remetente pode reencodar noutra resolução sem trocar de SSRC.
+            const src = voz_video.sourceSize();
+            if (src[0] != 0 and (src[0] != w.v_src_w or src[1] != w.v_src_h)) {
+                w.v_src_w = src[0];
+                w.v_src_h = src[1];
+                dbg("fonte do vídeo: {d}x{d}", .{ src[0], src[1] });
+            }
+            if (w.v_stat_ms == 0) {
+                w.v_stat_ms = now;
+                w.v_stat_frames = st.frames;
+                w.v_stat_unique = st.unique;
+                w.v_stat_bytes = st.bytes;
+                w.v_stat_pkts = w.v_pkts;
+                w.v_stat_seq = w.v_ext_seq;
+            } else if (now - w.v_stat_ms >= 5000) {
+                const dt: u64 = @intCast(@max(now - w.v_stat_ms, 1));
+                const fps = (st.frames - w.v_stat_frames) * 1000 / dt;
+                const uniq = (st.unique - w.v_stat_unique) * 1000 / dt;
+                const mbps = @as(f64, @floatFromInt(st.bytes - w.v_stat_bytes)) * 8 / @as(f64, @floatFromInt(dt)) / 1000;
+                const expected = w.v_ext_seq -% w.v_stat_seq;
+                const got = w.v_pkts - w.v_stat_pkts;
+                const loss = if (expected > 0 and got <= expected)
+                    @as(f64, @floatFromInt(expected - got)) * 100 / @as(f64, @floatFromInt(expected))
+                else
+                    0;
+                const dframes = st.frames - w.v_stat_frames;
+                const avg_frame = if (dframes > 0) (st.bytes - w.v_stat_bytes) / dframes else 0;
+                const pps = (w.v_pkts - w.v_stat_pkts) * 1000 / dt;
+                const enc_fps: u64 = if (w.v_ts_min != 0xffff_ffff and w.v_ts_min > 0) 90000 / w.v_ts_min else 0;
+                dbg("vídeo: {d} dec/s, {d} novos/s, mov {d}, {d:.2} Mbps, perda {d:.1}%, q={d}, src {d}x{d}, enc {d} fps, saltos {d}, fb={s}/{s}/{s}, key {d}, gaps {d}/{d}/{d}/{d}, quadro {d} B, {d} pkt/s", .{
+                    fps, uniq, st.motion, mbps, loss, w.video_quality, src[0], src[1], enc_fps, w.v_ts_big,
+                    if (fb_cc) "on" else "off",
+                    if (fb_rr) "on" else "off",
+                    if (fb_remb) "on" else "off",
+                    w.v_keys,
+                    w.v_gap_hist[0], w.v_gap_hist[1], w.v_gap_hist[2], w.v_gap_hist[3],
+                    avg_frame, pps,
+                });
+                w.v_gap_max = 0;
+                w.v_gap_hist = .{ 0, 0, 0, 0 };
+                w.v_keys = 0;
+                w.v_ts_min = 0xffff_ffff;
+                w.v_ts_big = 0;
+                w.v_stat_ms = now;
+                w.v_stat_frames = st.frames;
+                w.v_stat_unique = st.unique;
+                w.v_stat_bytes = st.bytes;
+                w.v_stat_pkts = w.v_pkts;
+                w.v_stat_seq = w.v_ext_seq;
+            }
+        }
         if (now >= w.next_keepalive) {
             const keep = [_]u8{ 0x13, 0x37 };
             _ = sys.sendTo(w.udp, &keep, &w.server);
             w.next_keepalive = now + 5000;
         }
-        if (now >= w.next_frame) {
+        if (w.v.kind == .voice and now >= w.next_frame) {
             w.sendFrame(now);
             w.next_frame += frame_ms;
             // O relógio do RTP anda com o tempo, falando ou não: quem recebe
@@ -535,7 +819,7 @@ const Worker = struct {
             out.deinit(alloc);
         }
         // Numa DM ou grupo o `server_id` é o canal (call_json.serverId).
-        call_json.writeIdentify(&out, alloc, w.v.guild, w.v.channel.load(.acquire), w.v.user, w.v.session[0..w.v.session_len], w.v.token[0..w.v.token_len], @intCast(c.daveMaxSupportedProtocolVersion())) catch return;
+        call_json.writeIdentify(&out, alloc, w.v.ident_server, w.v.ident_channel, w.v.user, w.v.session[0..w.v.session_len], w.v.token[0..w.v.token_len], @intCast(c.daveMaxSupportedProtocolVersion())) catch return;
         dbg("identify (DAVE até v{d})", .{c.daveMaxSupportedProtocolVersion()});
         _ = w.sendText(out.items);
     }
@@ -547,7 +831,7 @@ const Worker = struct {
             std.crypto.secureZero(u8, out.items);
             out.deinit(alloc);
         }
-        call_json.writeResume(&out, alloc, w.v.guild, w.v.channel.load(.acquire), w.v.session[0..w.v.session_len], w.v.token[0..w.v.token_len], w.last_seq) catch return;
+        call_json.writeResume(&out, alloc, w.v.ident_server, w.v.ident_channel, w.v.session[0..w.v.session_len], w.v.token[0..w.v.token_len], w.last_seq) catch return;
         dbg("resume", .{});
         _ = w.sendText(out.items);
     }
@@ -636,7 +920,7 @@ const Worker = struct {
             },
             6 => {
                 w.hb_acked = true;
-                if (w.hb_sent_ms != 0) w.v.emit(.{ .voice_ping = @intCast(std.math.clamp(nowMs() - w.hb_sent_ms, 1, 60_000)) });
+                if (w.hb_sent_ms != 0 and w.v.kind == .voice) w.v.emit(.{ .voice_ping = @intCast(std.math.clamp(nowMs() - w.hb_sent_ms, 1, 60_000)) });
             },
             2 => w.onReady(d),
             4 => w.onSession(d),
@@ -647,6 +931,11 @@ const Worker = struct {
                 w.next_frame = nowMs();
                 if (w.connected) {
                     w.announceSpeaking();
+                    w.announceVideo();
+                    // A sessão retomada também perdeu os pedidos de vídeo.
+                    w.n_sub = 0;
+                    for (&w.deps) |*slot| { slot.ssrc = 0; slot.dep.reset(); }
+                    w.syncWatch(true);
                     w.v.status(.connected);
                 }
             },
@@ -656,11 +945,16 @@ const Worker = struct {
             },
             // Flags e plataforma de quem está na call: também diz que ele está aqui.
             18, 20 => if (j.id(j.get(d, "user_id"))) |uid| w.addCallUser(uid),
+            12 => w.onVideo(d),
             13 => if (j.id(j.get(d, "user_id"))) |uid| {
                 _ = w.call_users.remove(uid);
+                _ = w.video_users.remove(uid);
                 w.removeSource(uid);
+                voz_video.removeUser(uid);
                 if (w.dave) |*dave| dave.removeUser(uid);
                 w.v.emit(.{ .voice_speaking = .{ .user = uid, .speaking = false } });
+                w.v.emit(.{ .voice_video = .{ .user = uid, .video_ssrc = 0, .active = false } });
+                if (voz_video.watching() == uid) w.syncWatch(true);
             },
             21 => {
                 const ver: u16 = @intCast(std.math.clamp(j.int(j.get(d, "protocol_version")) orelse 1, 0, 1));
@@ -679,7 +973,7 @@ const Worker = struct {
                     // Grupo novo: esquece o estado local e manda outro key package.
                     if (w.dave == null) w.initDave(ver);
                     if (w.dave) |*dave| {
-                        dave.reinit(ver, w.v.channel.load(.acquire));
+                        dave.reinit(ver, w.v.dave_group);
                         w.sendKeyPackage();
                     }
                 }
@@ -723,7 +1017,7 @@ const Worker = struct {
                     // e manda um key package novo.
                     dbg("commit/welcome inválido (transição {d})", .{tid});
                     w.sendInvalid(tid);
-                    dave.reinit(dave.version, w.v.channel.load(.acquire));
+                    dave.reinit(dave.version, w.v.dave_group);
                     w.sendKeyPackage();
                 }
             },
@@ -794,9 +1088,7 @@ const Worker = struct {
     fn selectProtocol(w: *Worker, ip: []const u8, port: u16) void {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(alloc);
-        out.appendSlice(alloc, "{\"op\":1,\"d\":{\"protocol\":\"udp\",\"data\":{\"address\":") catch return;
-        j.writeString(&out, alloc, ip) catch return;
-        out.print(alloc, ",\"port\":{d},\"mode\":\"aead_xchacha20_poly1305_rtpsize\"}}}}}}", .{port}) catch return;
+        call_json.writeSelectProtocol(&out, alloc, ip, port) catch return;
         _ = w.sendText(out.items);
     }
 
@@ -812,6 +1104,10 @@ const Worker = struct {
         for (keys, 0..) |kv, i| w.secret[i] = @intCast(std.math.clamp(j.int(kv) orelse 0, 0, 255));
         w.have_secret = true;
         const dave_ver: u16 = @intCast(std.math.clamp(j.int(j.get(d, "dave_protocol_version")) orelse 0, 0, 1));
+        const vcodec = j.str(j.get(d, "video_codec")) orelse "";
+        // `video_codec` é o que *enviamos*; não enviamos vídeo. Quem manda
+        // para nós escolhe entre o que dissemos decodificar (só H.264).
+        if (vcodec.len > 0 and !std.mem.eql(u8, vcodec, "H264")) dbg("sessão pede {s} para enviar; só recebemos H.264", .{vcodec});
         dbg("sessão pronta (DAVE v{d})", .{dave_ver});
         if (dave_ver > 0 and w.dave == null) {
             w.initDave(dave_ver);
@@ -821,7 +1117,24 @@ const Worker = struct {
         w.connected = true;
         w.next_frame = nowMs();
         w.next_keepalive = nowMs();
+        // O servidor esqueceu o que pedimos: pede de novo o stream assistido.
+        w.n_sub = 0;
+        for (&w.deps) |*slot| { slot.ssrc = 0; slot.dep.reset(); }
+        w.video_users.clearRetainingCapacity();
+        voz_video.clearStreams();
+        w.syncWatch(true);
+        // O servidor espera um op 12 antes de mandar vídeo; com 0/[] dizemos
+        // que só assistimos (o `video:true` do identify é a capacidade).
+        w.announceVideo();
         w.v.status(.connected);
+    }
+
+    /// Op 12: "não transmito vídeo" (mas recebo). Também reinicia o estado de
+    /// vídeo depois de um RESUME.
+    fn announceVideo(w: *Worker) void {
+        var b: [128]u8 = undefined;
+        const p = std.fmt.bufPrint(&b, "{{\"op\":12,\"d\":{{\"audio_ssrc\":{d},\"video_ssrc\":0,\"rtx_ssrc\":0,\"streams\":[]}}}}", .{w.ssrc}) catch return;
+        _ = w.sendText(p);
     }
 
     fn onSpeaking(w: *Worker, d: std.json.Value) void {
@@ -834,10 +1147,319 @@ const Worker = struct {
         if (w.dave) |*dave| dave.setSsrcUser(ssrc, uid);
     }
 
+    /// Uma linha com os campos de um objeto JSON, para o log de diagnóstico.
+    fn dumpObject(o: std.json.ObjectMap, a: std.mem.Allocator, buf: *std.ArrayList(u8)) void {
+        dumpObjectDepth(o, a, buf, 1);
+    }
+
+    fn dumpObjectDepth(o: std.json.ObjectMap, a: std.mem.Allocator, buf: *std.ArrayList(u8), depth: u8) void {
+        var it = o.iterator();
+        while (it.next()) |kv| {
+            switch (kv.value_ptr.*) {
+                .integer => |n| buf.print(a, "{s}={d} ", .{ kv.key_ptr.*, n }) catch return,
+                .float => |f| buf.print(a, "{s}={d:.2} ", .{ kv.key_ptr.*, f }) catch return,
+                .string => |s| buf.print(a, "{s}=\"{s}\" ", .{ kv.key_ptr.*, s }) catch return,
+                .bool => |b| buf.print(a, "{s}={} ", .{ kv.key_ptr.*, b }) catch return,
+                .array => |arr| buf.print(a, "{s}=[{d}] ", .{ kv.key_ptr.*, arr.items.len }) catch return,
+                .object => |sub| {
+                    buf.print(a, "{s}={{", .{kv.key_ptr.*}) catch return;
+                    if (depth > 0) dumpObjectDepth(sub, a, buf, depth - 1);
+                    buf.appendSlice(a, "} ") catch return;
+                },
+                .number_string => |s| buf.print(a, "{s}=%{s} ", .{ kv.key_ptr.*, s }) catch return,
+                else => {},
+            }
+        }
+    }
+
+    /// Op 12: quem está transmitindo vídeo e com qual SSRC. O servidor manda um
+    /// por pessoa ao conectar e a cada mudança (câmera/stream ligado ou não).
+    fn onVideo(w: *Worker, d: std.json.Value) void {
+        const uid = j.id(j.get(d, "user_id")) orelse return;
+        if (uid == w.v.user) return;
+        if (debugOn()) {
+            var b: [1024]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&b);
+            const a = fba.allocator();
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(a);
+            switch (d) {
+                .object => |o| dumpObject(o, a, &buf),
+                else => {},
+            }
+            for (j.array(j.get(d, "streams"))) |s| switch (s) {
+                .object => |o| {
+                    buf.appendSlice(a, "| ") catch break;
+                    dumpObject(o, a, &buf);
+                },
+                else => {},
+            };
+            dbg("op 12: {s}", .{buf.items});
+        }
+        var ssrc: u32 = @intCast(std.math.clamp(j.int(j.get(d, "video_ssrc")) orelse 0, 0, std.math.maxInt(u32)));
+        var rtx: u32 = @intCast(std.math.clamp(j.int(j.get(d, "rtx_ssrc")) orelse 0, 0, std.math.maxInt(u32)));
+        var best_q: i64 = -1;
+        var best_ssrc: u32 = 0;
+        var best_rtx: u32 = 0;
+        const list = j.array(j.get(d, "streams"));
+        for (list) |s| {
+            const ss: u32 = @intCast(std.math.clamp(j.int(j.get(s, "ssrc")) orelse 0, 0, std.math.maxInt(u32)));
+            if (ss == 0) continue;
+            const q = j.int(j.get(s, "quality")) orelse 0;
+            if (q <= best_q) continue;
+            best_q = q;
+            best_ssrc = ss;
+            best_rtx = @intCast(std.math.clamp(j.int(j.get(s, "rtx_ssrc")) orelse 0, 0, std.math.maxInt(u32)));
+        }
+        if (best_ssrc != 0) {
+            // O layer de maior qualidade pode estar inativo até alguém pedir
+            // (simulcast): pedimos ele mesmo assim, com op 15 qualidade 100.
+            ssrc = best_ssrc;
+            rtx = best_rtx;
+        }
+        if (debugOn()) {
+            for (list) |s| {
+                const ss: u32 = @intCast(std.math.clamp(j.int(j.get(s, "ssrc")) orelse 0, 0, std.math.maxInt(u32)));
+                if (ss == 0) continue;
+                const rid = j.str(j.get(s, "rid")) orelse "";
+                const q = j.int(j.get(s, "quality")) orelse 0;
+                const act = if (j.get(s, "active")) |a| a == .bool and a.bool else false;
+                var rw: i64 = 0;
+                var rh: i64 = 0;
+                if (j.get(s, "max_resolution")) |r| {
+                    rw = j.int(j.get(r, "width")) orelse 0;
+                    rh = j.int(j.get(r, "height")) orelse 0;
+                }
+                const mb = j.int(j.get(s, "max_bitrate")) orelse 0;
+                const mf = j.int(j.get(s, "max_framerate")) orelse 0;
+                dbg("camada {d}: rid={s} q={d} ativo={} {d}x{d} bitrate={d} fps={d}", .{ ss, rid, q, act, rw, rh, mb, mf });
+            }
+        }
+        if (ssrc == 0) {
+            _ = w.video_users.remove(uid);
+            voz_video.setStream(uid, 0, 0, false);
+            if (w.v.kind == .voice) w.v.emit(.{ .voice_video = .{ .user = uid, .video_ssrc = 0, .active = false } });
+            if (voz_video.watching() == uid) w.syncWatch(true);
+            return;
+        }
+        w.video_users.put(alloc, uid, ssrc) catch {};
+        w.addCallUser(uid);
+        // O DAVE do vídeo usa o SSRC do vídeo; a chave é a mesma pessoa.
+        if (w.dave) |*dave| dave.setSsrcUser(ssrc, uid);
+        voz_video.setStream(uid, ssrc, rtx, true);
+        // A interface só marca LIVE de câmera pelo op 12 da voz; o Go Live já
+        // aparece pelo `self_stream` do VOICE_STATE_UPDATE.
+        if (w.v.kind == .voice) w.v.emit(.{ .voice_video = .{ .user = uid, .video_ssrc = ssrc, .active = true } });
+        dbg("vídeo de {d}: ssrc {d} (rtx {d})", .{ uid, ssrc, rtx });
+        if (voz_video.watching() == uid) w.syncWatch(true);
+    }
+
+    /// Diz ao servidor quais SSRCs queremos receber (op 15) e pede quadro-chave
+    /// dos novos. A lista vem da interface (a grade da call pode ter vários).
+    fn syncWatch(w: *Worker, force: bool) void {
+        var list: [voz_video.max_watch]u32 = @splat(0);
+        const ssrcs = voz_video.watchSsrcs(if (w.v.kind == .stream) .stream else .voice, &list);
+        var same = ssrcs.len == w.n_sub;
+        if (same) {
+            for (ssrcs, 0..) |s, i| {
+                if (w.subs[i] == s) continue;
+                same = false;
+                break;
+            }
+        }
+        if (!force and same) return;
+        // Stream novo: o decodificador e as contas de qualidade recomeçam.
+        if (ssrcs.len != w.n_sub or (ssrcs.len > 0 and w.n_sub > 0 and ssrcs[0] != w.subs[0])) {
+            w.video_quality = 100;
+            w.qcheck_ms = 0;
+            w.remb_ms = 0;
+            w.v_stat_ms = 0;
+            w.v_have_seq = false;
+            w.v_cycle = 0;
+            w.v_ext_seq = 0;
+        }
+        for (ssrcs) |s| {
+            var had = false;
+            for (w.subs[0..w.n_sub]) |o| {
+                if (o != s) continue;
+                had = true;
+                break;
+            }
+            if (!had) w.sendPli(s);
+        }
+        w.last_pli_ms = nowMs();
+        // Quem saiu da lista é liberado pelo SSRC (sem tocar no resto do áudio).
+        var removed: [voz_video.max_watch]u32 = undefined;
+        var n_removed: usize = 0;
+        for (w.subs[0..w.n_sub]) |old| {
+            var keep = false;
+            for (ssrcs) |s| if (s == old) {
+                keep = true;
+                break;
+            };
+            if (keep or old == 0 or n_removed == removed.len) continue;
+            removed[n_removed] = old;
+            n_removed += 1;
+        }
+        if (n_removed > 0) w.sendSinkRelease(removed[0..n_removed]);
+        w.n_sub = 0;
+        for (ssrcs) |s| {
+            w.subs[w.n_sub] = s;
+            w.n_sub += 1;
+        }
+        if (ssrcs.len > 0) w.sendSinkWants();
+        if (ssrcs.len > 0) dbg("assistindo {d} ssrc(s) ({s}), primeiro {d}", .{ ssrcs.len, if (w.v.kind == .stream) "stream" else "voz", ssrcs[0] });
+    }
+
+    /// O SSRC principal (o primeiro da lista): é dele que saem perda, jitter e
+    /// os relatórios RTCP. Os outros são só decodificados para a grade.
+    fn primary(w: *const Worker) u32 {
+        return if (w.n_sub > 0) w.subs[0] else 0;
+    }
+
+    /// Remontagem do SSRC: reaproveita a vaga dele ou pega uma livre.
+    fn depFor(w: *Worker, ssrc: u32) *video_rtp.Depacketizer {
+        for (w.deps[0..w.deps.len]) |*slot| {
+            if (slot.ssrc == ssrc) return &slot.dep;
+        }
+        for (w.deps[0..w.deps.len]) |*slot| {
+            if (slot.ssrc != 0) continue;
+            slot.ssrc = ssrc;
+            slot.dep.reset();
+            return &slot.dep;
+        }
+        w.deps[0].ssrc = ssrc;
+        w.deps[0].dep.reset();
+        return &w.deps[0].dep;
+    }
+
+    fn sendSinkWants(w: *Worker) void {
+        var list: [voz_video.max_watch]u32 = @splat(0);
+        const ssrcs = voz_video.watchSsrcs(if (w.v.kind == .stream) .stream else .voice, &list);
+        var b: [512]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&b);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(fba.allocator());
+        call_json.writeSinkWants(&out, fba.allocator(), ssrcs, w.video_quality, w.v.kind == .stream) catch return;
+        _ = w.sendText(out.items);
+    }
+
+    /// Solta SSRCs específicos (nunca "any": 0 — no Discord isso calava o áudio
+    /// da call junto).
+    fn sendSinkRelease(w: *Worker, ssrcs: []const u32) void {
+        var b: [256]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&b);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(fba.allocator());
+        out.appendSlice(fba.allocator(), "{\"op\":15,\"d\":{") catch return;
+        for (ssrcs) |s| out.print(fba.allocator(), "\"{d}\":0,", .{s}) catch return;
+        out.print(fba.allocator(), "\"any\":{d}}}", .{if (w.v.kind == .stream) @as(u8, 100) else 0}) catch return;
+        _ = w.sendText(out.items);
+    }
+
+    /// RTCP PLI: o cabeçalho vai em claro e só o SSRC da mídia é cifrado, como
+    /// no RTP "rtpsize" (mesmo contador de nonce).
+    fn sendPli(w: *Worker, media: u32) void {
+        if (!sys.valid(w.udp) or !w.have_secret) return;
+        var plain: [12]u8 = undefined;
+        _ = video_rtp.writePli(&plain, w.ssrc, media) orelse return;
+        var buf: [8 + 4 + 16 + 4]u8 = undefined;
+        @memcpy(buf[0..8], plain[0..8]);
+        var nonce: [24]u8 = @splat(0);
+        w.nonce +%= 1;
+        std.mem.writeInt(u32, nonce[0..4], w.nonce, .big);
+        var tag: [16]u8 = undefined;
+        const aead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
+        aead.encrypt(buf[8..12], &tag, plain[8..12], buf[0..8], nonce, w.secret);
+        @memcpy(buf[12..28], &tag);
+        @memcpy(buf[28..32], nonce[0..4]);
+        _ = sys.sendTo(w.udp, &buf, &w.server);
+    }
+
+    /// RTCP Transport Feedback (RTPFB, PT 205, FMT 15): um pacote recebido,
+    /// delta pequeno. É o sinal que o controle de congestionamento do Discord
+    /// usa para liberar bitrate.
+    fn ccAdd(w: *Worker, seq: u16) void {
+        if (!fb_cc or !w.have_secret) return;
+        if (w.cc_n == w.cc_samples.len) w.flushTransportCc(nowMs());
+        w.cc_samples[w.cc_n] = .{ .seq = seq, .us = @intCast(c.SDL_GetTicksNS() / 1000) };
+        w.cc_n += 1;
+    }
+
+    /// Envia o lote: um RTCP a cada ~50 ms, como o Chrome, em vez de um por
+    /// pacote (o SFU lia a enxurrada como perda atrás de perda).
+    fn flushTransportCc(w: *Worker, now: i64) void {
+        _ = now;
+        if (w.cc_n == 0) return;
+        const n = w.cc_n;
+        w.cc_n = 0;
+        if (!fb_cc or w.cc_media == 0 or !sys.valid(w.udp) or !w.have_secret) return;
+        var plain: [1024]u8 = undefined;
+        const p = video_rtp.writeTransportCc(&plain, w.ssrc, w.cc_media, w.cc_samples[0..n], w.cc_pkt) orelse return;
+        w.cc_pkt +%= 1;
+        var buf: [1044]u8 = undefined;
+        @memcpy(buf[0..8], p[0..8]);
+        var nonce: [24]u8 = @splat(0);
+        w.nonce +%= 1;
+        std.mem.writeInt(u32, nonce[0..4], w.nonce, .big);
+        var tag: [16]u8 = undefined;
+        const aead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
+        aead.encrypt(buf[8..p.len], &tag, p[8..p.len], p[0..8], nonce, w.secret);
+        @memcpy(buf[p.len..][0..16], &tag);
+        @memcpy(buf[p.len + 16 ..][0..4], nonce[0..4]);
+        _ = sys.sendTo(w.udp, buf[0 .. p.len + 20], &w.server);
+    }
+
+    /// RTCP Receiver Report (PT 201): o SFU usa perda/jitter para estimar o
+    /// canal e liberar mais bitrate. O cabeçalho (8 bytes) vai em claro; o
+    /// bloco de relatório (24 bytes) é cifrado, como todo RTCP "rtpsize".
+    fn sendRtcpRr(w: *Worker, media: u32) void {
+        if (!fb_rr) return;
+        if (!sys.valid(w.udp) or !w.have_secret or !w.v_have_seq) return;
+        var plain: [32]u8 = undefined;
+        const jitter: u32 = @intFromFloat(@max(w.v_jit, 0));
+        const dlsr: u32 = if (w.sr_ms != 0)
+            @intCast(@divTrunc((nowMs() - w.sr_ms) * 65536, 1000))
+        else
+            0;
+        _ = video_rtp.writeRr(&plain, w.ssrc, media, w.v_ext_seq, jitter, w.sr_lsr, dlsr) orelse return;
+        var buf: [8 + 24 + 16 + 4]u8 = undefined;
+        @memcpy(buf[0..8], plain[0..8]);
+        var nonce: [24]u8 = @splat(0);
+        w.nonce +%= 1;
+        std.mem.writeInt(u32, nonce[0..4], w.nonce, .big);
+        var tag: [16]u8 = undefined;
+        const aead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
+        aead.encrypt(buf[8..32], &tag, plain[8..32], buf[0..8], nonce, w.secret);
+        @memcpy(buf[32..48], &tag);
+        @memcpy(buf[48..52], nonce[0..4]);
+        _ = sys.sendTo(w.udp, &buf, &w.server);
+    }
+
+    /// RTCP REMB (PT 206): diz quanto cabe no nosso enlace. O SFU/remetente
+    /// pode então soltar um bitrate maior que o mínimo.
+    fn sendRemb(w: *Worker, media: u32, bitrate: u32) void {
+        if (!fb_remb) return;
+        if (!sys.valid(w.udp) or !w.have_secret) return;
+        var plain: [24]u8 = undefined;
+        _ = video_rtp.writeRemb(&plain, w.ssrc, media, bitrate) orelse return;
+        var buf: [8 + 16 + 16 + 4]u8 = undefined;
+        @memcpy(buf[0..8], plain[0..8]);
+        var nonce: [24]u8 = @splat(0);
+        w.nonce +%= 1;
+        std.mem.writeInt(u32, nonce[0..4], w.nonce, .big);
+        var tag: [16]u8 = undefined;
+        const aead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
+        aead.encrypt(buf[8..24], &tag, plain[8..24], buf[0..8], nonce, w.secret);
+        @memcpy(buf[24..40], &tag);
+        @memcpy(buf[40..44], nonce[0..4]);
+        _ = sys.sendTo(w.udp, &buf, &w.server);
+    }
+
     // --- DAVE --------------------------------------------------------------
 
     fn initDave(w: *Worker, version: u16) void {
-        var d = Dave.init(w.v.channel.load(.acquire), w.v.user, version) orelse {
+        var d = Dave.init(w.v.dave_group, w.v.user, version) orelse {
             std.log.warn("voz: DAVE indisponível", .{});
             return;
         };
@@ -846,6 +1468,9 @@ const Worker = struct {
         while (ui.next()) |u| d.addUser(u.*);
         var si = w.call_ssrcs.iterator();
         while (si.next()) |kv| d.setSsrcUser(kv.key_ptr.*, kv.value_ptr.*);
+        // Vídeo anunciado antes de o DAVE nascer (o op 12 pode vir antes do op 4).
+        var vi = w.video_users.iterator();
+        while (vi.next()) |kv| d.setSsrcUser(kv.value_ptr.*, kv.key_ptr.*);
         w.dave = d;
     }
 
@@ -873,6 +1498,7 @@ const Worker = struct {
     /// para falar), mais 5 quadros de silêncio no fim, como o cliente oficial,
     /// e nada quando mudo, por nós ou pelo servidor.
     fn sendFrame(w: *Worker, now: i64) void {
+        if (w.v.kind == .stream) return;
         const sh = &voz_audio.sh;
         const blocked = w.v.micBlocked();
         var pcm: [frame_samples * channels]i16 = undefined;
@@ -950,11 +1576,14 @@ const Worker = struct {
     /// oficial); mandar "parei" fazia o servidor descartar o começo
     /// da próxima fala, que chega pelo UDP antes do "voltei" pelo WebSocket.
     fn setSpeaking(w: *Worker, on: bool) void {
+        if (w.v.kind == .stream) return;
         w.v.emit(.{ .voice_speaking = .{ .user = w.v.user, .speaking = on } });
     }
 
-    /// Op 5: "este SSRC manda áudio de microfone".
+    /// Op 5: "este SSRC manda áudio de microfone". Um espectador de stream não
+    /// manda mídia nenhuma.
     fn announceSpeaking(w: *Worker) void {
+        if (w.v.kind == .stream) return;
         var b: [96]u8 = undefined;
         const p = std.fmt.bufPrint(&b, "{{\"op\":5,\"d\":{{\"speaking\":1,\"delay\":0,\"ssrc\":{d}}}}}", .{w.ssrc}) catch return;
         _ = w.sendText(p);
@@ -986,10 +1615,198 @@ const Worker = struct {
         w.rtp_seq +%= 1;
     }
 
-    fn onRtp(w: *Worker, buf: []const u8) void {
-        if (buf.len < 12 + 16 + 4 or !w.have_secret) return;
+    /// RTP de vídeo: decifra, tira as extensões, remonta o H.264 e, se for o
+    /// stream assistido, manda o quadro inteiro para a thread de decodificação.
+    fn onVideoRtp(w: *Worker, buf: []const u8) void {
+        if (!w.have_secret) return;
+        const h = video_rtp.parseHeader(buf) orelse return;
+        if (!voz_video.isWatched(h.ssrc)) {
+            // Outra camada/stream a chegar: mostra uma vez, sem decodificar.
+            var known = false;
+            for (w.v_seen) |s| {
+                if (s == h.ssrc) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) {
+                var i: usize = 0;
+                while (i < w.v_seen.len) : (i += 1) {
+                    if (w.v_seen[i] == 0) {
+                        w.v_seen[i] = h.ssrc;
+                        break;
+                    }
+                }
+                dbg("vídeo de outro ssrc {d} (não assistido)", .{h.ssrc});
+            }
+            return;
+        }
+        const is_primary = h.ssrc == w.primary();
+        if (is_primary) {
+            w.v_pkts +%= 1;
+            // Jitter RFC 3550 (A.8) para o Receiver Report: chegada (relógio de
+            // 90 kHz) menos carimbo do pacote, suavizado.
+            const arr_us: u64 = @intCast(c.SDL_GetTicksNS() / 1000);
+            if (w.v_jit_have and arr_us > w.v_jit_arr_us) {
+                const dt_rtp: f64 = @floatFromInt(@as(i32, @bitCast(h.ts -% w.v_jit_ts)));
+                const dt_arr: f64 = @as(f64, @floatFromInt(arr_us - w.v_jit_arr_us)) * 90.0 / 1_000_000.0;
+                w.v_jit += (@abs(dt_arr - dt_rtp) - w.v_jit) / 16.0;
+            }
+            w.v_jit_ts = h.ts;
+            w.v_jit_arr_us = arr_us;
+            w.v_jit_have = true;
+        }
+        // Para o RTCP Receiver Report: sequência estendida (o contador de 16
+        // bits dá a volta) e o pacote mais alto que chegou. Pacote atrasado
+        // (fora de ordem) não mexe no maior.
+        if (is_primary) {
+            const forward = !w.v_have_seq or (h.seq -% w.v_last_seq) < 0x8000;
+            if (forward) {
+                if (w.v_have_seq and h.seq < w.v_last_seq) w.v_cycle +%= 1;
+                w.v_last_seq = h.seq;
+                w.v_have_seq = true;
+                const ext: u32 = (@as(u32, w.v_cycle) << 16) | h.seq;
+                if (ext > w.v_ext_seq) w.v_ext_seq = ext;
+            }
+        }
+        if (buf.len < h.aad_len + 20) return;
+        const cipher = buf[h.aad_len .. buf.len - 20];
+        voz_video.noteBytes(cipher.len);
+        if (cipher.len > 2048) return;
+        var tag: [16]u8 = undefined;
+        @memcpy(&tag, buf[buf.len - 20 ..][0..16]);
+        var nonce: [24]u8 = @splat(0);
+        @memcpy(nonce[0..4], buf[buf.len - 4 ..]);
+        var plain: [2048]u8 = undefined;
+        const aead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
+        aead.decrypt(plain[0..cipher.len], cipher, tag, buf[0..h.aad_len], nonce, w.secret) catch return;
+        var end = cipher.len;
+        if (h.padding) {
+            if (end == 0 or plain[end - 1] == 0 or plain[end - 1] > end) return;
+            end -= plain[end - 1];
+        }
+        if (h.ext_len > end) return;
+        if (h.ext_len > 0) {
+            if (video_rtp.transportSeq(plain[0..h.ext_len])) |tseq| {
+                w.cc_media = h.ssrc;
+                w.ccAdd(tseq);
+            } else if (debugOn() and !w.cc_missing) {
+                w.cc_missing = true;
+                dbg("extensão transport-cc (id 5) ausente nos pacotes de vídeo", .{});
+            }
+        } else if (debugOn() and !w.cc_missing) {
+            w.cc_missing = true;
+            dbg("pacotes de vídeo sem extensões RTP (transport-cc não vai)", .{});
+        }
+        const payload = plain[h.ext_len..end];
+        if (payload.len == 0) return;
+        const dep = w.depFor(h.ssrc);
+        const complete = dep.feed(alloc, payload, h.ts, h.seq, h.marker) catch {
+            dep.reset();
+            return;
+        };
+        if (!complete) return;
+        // Daqui para baixo são diagnósticos: contam só o stream principal.
+        if (is_primary) {
+            if (dep.key) w.v_keys +%= 1;
+            // Intervalo entre os carimbos de tempo dos quadros: o fps que o
+            // encoder produziu. Se for 60 e decodificarmos 40, quem perdeu
+            // quadros foi o caminho (SFU), não o encoder.
+            if (w.v_have_ts) {
+                const d = dep.ts -% w.v_last_ts;
+                if (d > 0 and d < 90000) {
+                    if (d < w.v_ts_min) w.v_ts_min = d;
+                    if (d > 2500) w.v_ts_big +%= 1; // > 27 ms: faltou quadro no meio
+                }
+            }
+            w.v_last_ts = dep.ts;
+            w.v_have_ts = true;
+            // Intervalo entre quadros: se o SFU manda em rajadas, a imagem
+            // "trava" e depois corre, mesmo com 60/s na média.
+            const t_frame = nowMs();
+            if (w.v_last_frame_ms != 0) {
+                const gap = t_frame - w.v_last_frame_ms;
+                if (gap > w.v_gap_max) w.v_gap_max = gap;
+                // Histograma: um stream "liso" tem quase tudo abaixo de 20 ms.
+                if (gap < 20) {
+                    w.v_gap_hist[0] += 1;
+                } else if (gap < 40) {
+                    w.v_gap_hist[1] += 1;
+                } else if (gap < 80) {
+                    w.v_gap_hist[2] += 1;
+                } else {
+                    w.v_gap_hist[3] += 1;
+                }
+            }
+            w.v_last_frame_ms = t_frame;
+        }
+        var frame: []const u8 = dep.frame();
+        // Marcador 0xFAFA no fim: o quadro veio cifrado pelo DAVE. Sem ele é
+        // H.264 puro (call sem E2EE ou no meio de uma transição).
+        if (frame.len >= 2 and frame[frame.len - 1] == 0xFA and frame[frame.len - 2] == 0xFA) {
+            const dave = if (w.dave) |*d| d else {
+                dep.consumed();
+                return;
+            };
+            const need = frame.len + 512;
+            if (w.video_plain.items.len < need) {
+                w.video_plain.resize(alloc, need) catch {
+                    dep.consumed();
+                    return;
+                };
+            }
+            const n = dave.decrypt(c.DAVE_MEDIA_TYPE_VIDEO, h.ssrc, 0, frame, w.video_plain.items) orelse {
+                w.stats.undecrypted += 1;
+                dep.consumed();
+                return;
+            };
+            frame = w.video_plain.items[0..n];
+        }
+        voz_video.push(h.ssrc, frame);
+        dep.consumed();
+    }
+
+    /// RTCP que chega do SFU: só o Sender Report interessa — dele saem o LSR e
+    /// o DLSR (RTT) do nosso Receiver Report. O começo vai em claro; o resto é
+    /// cifrado como no RTP.
+    fn onRtcp(w: *Worker, buf: []const u8) void {
+        if (!w.have_secret or buf.len < 8 + 20) return;
         if ((buf[0] >> 6) != 2) return;
-        if ((buf[1] & 0x7f) != 120) return; // só Opus (RTCP e o resto ficam de fora)
+        if (buf[1] != 200) return; // Sender Report
+        const body = buf[8 .. buf.len - 20];
+        if (body.len < 20 or body.len > 512) return;
+        var plain: [512]u8 = undefined;
+        var tag: [16]u8 = undefined;
+        @memcpy(&tag, buf[buf.len - 20 ..][0..16]);
+        var nonce: [24]u8 = @splat(0);
+        @memcpy(nonce[0..4], buf[buf.len - 4 ..]);
+        const aead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
+        aead.decrypt(plain[0..body.len], body, tag, buf[0..8], nonce, w.secret) catch return;
+        // plain[0..4] = NTP (parte inteira), plain[4..8] = fração.
+        const ntp_msw = std.mem.readInt(u32, plain[0..4], .big);
+        const ntp_lsw = std.mem.readInt(u32, plain[4..8], .big);
+        w.sr_lsr = (ntp_msw << 16) | (ntp_lsw >> 16);
+        w.sr_ms = nowMs();
+    }
+
+    fn onRtp(w: *Worker, buf: []const u8) void {
+        if (buf.len < 12) return;
+        if ((buf[0] >> 6) != 2) return;
+        // RTCP divide o socket com o RTP: por enquanto só os relatórios do
+        // servidor (não usamos) e o nosso PLI importam.
+        if (video_rtp.isRtcp(buf)) {
+            w.onRtcp(buf);
+            return;
+        }
+        const pt = buf[1] & 0x7f;
+        if (pt != opus_pt) {
+            // O SFU pode renumerar o payload type do vídeo: quem decide é o
+            // SSRC assistido (o RTX usa outro SSRC e cai fora).
+            w.onVideoRtp(buf);
+            return;
+        }
+        if (!w.have_secret) return;
+        if (buf.len < 12 + 16 + 4) return;
         const ssrc = std.mem.readInt(u32, buf[8..12], .big);
         if (ssrc == w.ssrc) return;
         // Nos modos "rtpsize" só o cabeçalho fixo, os CSRC e os 4 bytes do
@@ -1022,9 +1839,18 @@ const Worker = struct {
             end -= plain[end - 1];
         }
         if (ext_words * 4 > end) return;
+        // O mesmo transporte leva áudio e vídeo: o feedback em lote cobre a
+        // faixa inteira, então os pacotes de áudio precisam entrar também —
+        // sem isso o SFU lê cada um deles como perdido.
+        if (ext_words > 0) {
+            if (video_rtp.transportSeq(plain[0 .. ext_words * 4])) |tseq| w.ccAdd(tseq);
+        }
         var frame: []const u8 = plain[ext_words * 4 .. end];
         if (frame.len == 0) return;
-        const src = w.sourceFor(ssrc, 0) orelse return;
+        // No stream (Go Live) não há op 5 dizendo quem fala: o dono é o do
+        // stream, e é ele que o DAVE precisa para achar a chave do áudio.
+        const uid: Id = if (w.v.kind == .stream) w.v.user else 0;
+        const src = w.sourceFor(ssrc, uid) orelse return;
         const seq = std.mem.readInt(u16, buf[2..4], .big);
         const ts = std.mem.readInt(u32, buf[4..8], .big);
         if (std.mem.eql(u8, frame, &silence)) {
@@ -1045,7 +1871,7 @@ const Worker = struct {
         var dave_out: [2048]u8 = undefined;
         if (frame.len >= 2 and frame[frame.len - 1] == 0xFA and frame[frame.len - 2] == 0xFA) {
             const dave = if (w.dave) |*d| d else return;
-            const n = dave.decrypt(ssrc, src.user, frame, &dave_out) orelse {
+            const n = dave.decrypt(c.DAVE_MEDIA_TYPE_AUDIO, ssrc, src.user, frame, &dave_out) orelse {
                 w.stats.undecrypted += 1;
                 return;
             };
@@ -1072,8 +1898,11 @@ const Worker = struct {
             const now = nowMs();
             w.out.open(now);
             w.updatePull();
-            w.mic.paused = w.v.micBlocked();
-            w.mic.open(now);
+            // Espectador de stream só ouve (o som do stream, se houver).
+            if (w.v.kind == .voice) {
+                w.mic.paused = w.v.micBlocked();
+                w.mic.open(now);
+            }
         }
         w.applyAudioFlags();
         w.reportAudio();
@@ -1120,6 +1949,7 @@ const Worker = struct {
     /// Avisa a interface quando o microfone ou a saída mudam de situação: ela
     /// mostra na barra de voz, em vez de ficar calada sem explicação.
     fn reportAudio(w: *Worker) void {
+        if (w.v.kind == .stream) return;
         const mic_ok = !w.mic.failed();
         const out_ok = w.out.dev != 0;
         if (mic_ok == w.mic_ok_sent and out_ok == w.out_ok_sent) return;
@@ -1177,7 +2007,7 @@ const Worker = struct {
         if (!src.speaking or now - src.last_emit_ms > 1000) {
             src.speaking = true;
             src.last_emit_ms = now;
-            if (src.user != 0) w.v.emit(.{ .voice_speaking = .{ .user = src.user, .speaking = true } });
+            if (src.user != 0 and w.v.kind == .voice) w.v.emit(.{ .voice_speaking = .{ .user = src.user, .speaking = true } });
         }
         src.last_ms = now;
         w.stats.packets += 1;
@@ -1313,7 +2143,7 @@ const Worker = struct {
     fn expireSpeakers(w: *Worker, now: i64) void {
         for (w.sources[0..w.n_sources]) |*s| if (s.speaking and now - s.last_ms > 400) {
             s.speaking = false;
-            if (s.user != 0) w.v.emit(.{ .voice_speaking = .{ .user = s.user, .speaking = false } });
+            if (s.user != 0 and w.v.kind == .voice) w.v.emit(.{ .voice_speaking = .{ .user = s.user, .speaking = false } });
         };
     }
 };
@@ -1631,19 +2461,19 @@ const Dave = struct {
         return written;
     }
 
-    fn decrypt(d: *Dave, ssrc: u32, user: Id, frame: []const u8, out: []u8) ?usize {
-        // O decryptor aparece quando o SSRC é anunciado (op 5); se o áudio
-        // chegou antes e já sabemos de quem é, cria agora.
+    fn decrypt(d: *Dave, media: c.DAVEMediaType, ssrc: u32, user: Id, frame: []const u8, out: []u8) ?usize {
+        // O decryptor aparece quando o SSRC é anunciado (op 5/op 12); se a
+        // mídia chegou antes e já sabemos de quem é, cria agora.
         if (d.decryptors.get(ssrc) == null) {
             const owner = d.ssrc_users.get(ssrc) orelse user;
             if (owner == 0) return null;
             d.setSsrcUser(ssrc, owner);
         }
         const dec = d.decryptors.get(ssrc) orelse return null;
-        const cap = c.daveDecryptorGetMaxPlaintextByteSize(dec, c.DAVE_MEDIA_TYPE_AUDIO, frame.len);
+        const cap = c.daveDecryptorGetMaxPlaintextByteSize(dec, media, frame.len);
         if (cap > out.len) return null;
         var written: usize = 0;
-        const rc = c.daveDecryptorDecrypt(dec, c.DAVE_MEDIA_TYPE_AUDIO, frame.ptr, frame.len, out.ptr, out.len, &written);
+        const rc = c.daveDecryptorDecrypt(dec, media, frame.ptr, frame.len, out.ptr, out.len, &written);
         if (rc != c.DAVE_DECRYPTOR_RESULT_CODE_SUCCESS) return null;
         return written;
     }

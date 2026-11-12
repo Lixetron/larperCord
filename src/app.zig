@@ -55,6 +55,7 @@ const app_accounts = @import("app_accounts.zig");
 const app_chamada = @import("app_chamada.zig");
 const app_presenca = @import("app_presenca.zig");
 const voz_audio = @import("net/voz_audio.zig");
+const voz_video = @import("net/voz_video.zig");
 const lsp_net = @import("net/lsp.zig");
 const updater = @import("net/updater.zig");
 const lsp_ui = @import("ui/lsp_ui.zig");
@@ -955,8 +956,18 @@ pub const App = struct {
         app.st.voice_ping_ms = 0;
         app.st.voice_mic_failed = false;
         app.st.voice_out_failed = false;
+        app.st.clearStreams();
+        voz_video.watch(0, .voice);
         voz_audio.sh.server_mute.store(false, .release);
         voz_audio.sh.server_deaf.store(false, .release);
+    }
+
+    /// Fecha o visualizador e diz à thread de voz para parar de pedir o stream.
+    pub fn stopWatching(app: *App) void {
+        app.st.stopWatching();
+        voz_video.watch(0, .voice);
+        // Se era um Go Live, o gateway desconecta do servidor de stream.
+        app.cmd(.{ .watch_stream = 0 });
     }
 
     /// O servidor nos mutou ou ensurdeceu (ou deixou de): a thread de voz para
@@ -1677,6 +1688,8 @@ pub const App = struct {
             .remove_relationship => |rel| app.cmd(.{ .relationship = .{ .user = rel.user, .accept = false, .from = rel.from } }),
             .select_channel => |ch| {
                 if (app.opts.qa and c.SDL_getenv("QA_DEBUG") != null) std.debug.print("[ação] select_channel ctrl={}\n", .{app.io.*.KeyCtrl});
+                // Escolher uma conversa volta para o chat (a grade da call some).
+                st.call_view = false;
                 if (app.store.channel(ch)) |cs| if (!app.store.canAccess(&cs.info)) {
                     return st.showToast(now(), true, "você não tem acesso a #{s}", "you don't have access to #{s}", .{cs.info.name});
                 };
@@ -1865,20 +1878,20 @@ pub const App = struct {
                 app.cmd(.{ .typing = id });
             },
             .toggle_voice => |ch| {
-                if (st.voice != ch) if (app.store.channel(ch)) |cs| if (!app.store.canAccess(&cs.info)) {
+                if (st.voice == ch) {
+                    // Já está nele: clicar de novo volta para a grade da chamada
+                    // (sair é pelo botão de desconectar da faixa de voz).
+                    st.call_view = true;
+                    return;
+                }
+                if (app.store.channel(ch)) |cs| if (!app.store.canAccess(&cs.info)) {
                     return st.showToast(now(), true, "você não pode entrar em {s}", "you can't join {s}", .{cs.info.name});
                 };
-                if (st.voice == ch) {
-                    st.voice = null;
-                    st.voice_status = .disconnected;
-                    st.voice_mixer = false;
-                    app.resetCallState();
-                    voz_audio.play(.leave);
-                    app.cmd(.{ .join_voice = .{ .guild = st.voice_guild, .channel = null, .mute = st.muted, .deaf = st.deafened } });
-                } else {
+                {
                     const cs = app.store.channel(ch) orelse return;
                     if (cs.info.kind != .voice) return;
                     st.voice = ch;
+                    st.call_view = true;
                     st.voice_guild = cs.info.guild;
                     st.voice_status = .connecting;
                     st.voice_mixer = false;
@@ -1888,6 +1901,7 @@ pub const App = struct {
                 }
             },
             .leave_voice => {
+                st.call_view = false;
                 if (st.voice != null) voz_audio.play(.leave);
                 app.resetCallState();
                 st.voice = null;
@@ -1907,6 +1921,24 @@ pub const App = struct {
                 if (st.voice != null) app.cmd(.{ .voice_flags = .{ .mute = st.muted, .deaf = st.deafened } });
             },
             .toggle_voice_mixer => st.voice_mixer = !st.voice_mixer,
+            .watch_stream => |u| {
+                const camera = app.st.streamOf(u) != null or app.store.voiceFlags(u).camera;
+                const live = app.store.voiceFlags(u).stream;
+                if (u == 0 or app.st.watching == u or app.st.voice == null or (!camera and !live)) {
+                    app.stopWatching();
+                } else if (camera) {
+                    app.st.watching = u;
+                    app.st.stream_open = true;
+                    app.st.stream_fullscreen = false;
+                    voz_video.watch(u, .voice);
+                } else {
+                    app.st.watching = u;
+                    app.st.stream_open = true;
+                    app.st.stream_fullscreen = false;
+                    voz_video.watch(u, .stream);
+                    app.cmd(.{ .watch_stream = u });
+                }
+            },
             .start_call => |ch| app_chamada.start(app, ch),
             .accept_call => app_chamada.accept(app),
             .decline_call => app_chamada.decline(app),
@@ -2134,6 +2166,7 @@ pub const App = struct {
                     voz_audio.play(.leave);
                     app.resetCallState();
                     app.st.voice = null;
+                    app.st.call_view = false;
                     app.st.voice_status = .disconnected;
                     app.st.voice_mixer = false;
                 }
@@ -2143,6 +2176,18 @@ pub const App = struct {
             if (e == .voice_state and e.voice_state.user != app.store.me and app.store.me != 0) app.othersVoice(e.voice_state.user, e.voice_state.channel);
             if (e == .voice_ping) app.st.voice_ping_ms = e.voice_ping;
             if (e == .voice_audio) app.voiceAudio(e.voice_audio.mic_ok, e.voice_audio.out_ok);
+            if (e == .voice_video) {
+                const was_watching = app.st.watching == e.voice_video.user;
+                app.st.setStream(e.voice_video.user, e.voice_video.video_ssrc, e.voice_video.active);
+                voz_video.setStream(e.voice_video.user, e.voice_video.video_ssrc, 0, e.voice_video.active);
+                if (!e.voice_video.active and was_watching) app.stopWatching();
+            }
+            if (e == .stream_ended) {
+                if (app.st.watching == e.stream_ended and voz_video.watchSource() == .stream) {
+                    app.stopWatching();
+                    app.st.showToast(now(), false, "o stream acabou", "the stream ended", .{});
+                }
+            }
             if (e == .history) timeline.mark(.historico);
             if (e == .status and e.status == .failed) failed = true;
             if (e == .net_fail and app.login.phase == .connecting) app.login.net_fail = e.net_fail;
@@ -3061,6 +3106,9 @@ pub const App = struct {
             const clear = [4]f32{ bg.r * bg.a, bg.g * bg.a, bg.b * bg.a, bg.a };
             const draw_data = c.ImGui_GetDrawData();
             if (@import("ui/video.zig").takeChanged()) app.gate.redraw();
+            // O quadro do stream muda só o conteúdo da textura: o Gate não vê
+            // diferença no desenho e precisa ser avisado.
+            if (@import("ui/stream.zig").takeChanged()) app.gate.redraw();
             // GIF que toca aos poucos: quadro novo na mesma textura, com o desenho igual.
             const gif_changed = app.images.takeChanged();
             // Igual ao que já está na tela: sem GPU nem present. Prints e QA leem os pixels.
@@ -3393,6 +3441,9 @@ pub const App = struct {
         const clear = [4]f32{ bg.r * bg.a, bg.g * bg.a, bg.b * bg.a, bg.a };
         const draw_data = c.ImGui_GetDrawData();
         if (@import("ui/video.zig").takeChanged()) app.gate.redraw();
+        // O quadro do stream muda só o conteúdo da textura: o Gate não vê
+        // diferença no desenho e precisa ser avisado.
+        if (@import("ui/stream.zig").takeChanged()) app.gate.redraw();
         const gif_changed = app.images.takeChanged();
         const show = app.gate.check(quadro.sum(draw_data, clear), gif_changed or wl.shot != null or quadro.texturesDirty(draw_data));
         if (show) {

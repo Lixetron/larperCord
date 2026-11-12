@@ -55,6 +55,7 @@ pub fn reset() void {
 fn join(app: *App, ch: Id) void {
     const st = &app.st;
     st.voice = ch;
+    st.call_view = true;
     st.voice_guild = 0;
     st.voice_status = .connecting;
     st.voice_mixer = false;

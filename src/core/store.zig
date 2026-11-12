@@ -1133,7 +1133,7 @@ pub const Store = struct {
     pub fn apply(s: *Store, ev: Event, now_ms: i64) !void {
         // O que chega o tempo todo e não aparece na caixa de entrada não conta.
         switch (ev) {
-            .typing_start, .presence_update, .voice_state, .voice_member_flags, .voice_speaking, .voice_ping, .voice_audio, .voice_status, .call, .channel_info, .voice_start, .latency, .status, .net_fail, .notice, .member_list, .profile, .relationship, .note, .app_icon, .pins, .pins_changed, .invite, .read, .thread_members, .thread_joined, .thread_open, .threads_page, .conta => {},
+            .typing_start, .presence_update, .voice_state, .voice_member_flags, .voice_speaking, .voice_video, .stream_ended, .voice_ping, .voice_audio, .voice_status, .call, .channel_info, .voice_start, .latency, .status, .net_fail, .notice, .member_list, .profile, .relationship, .note, .app_icon, .pins, .pins_changed, .invite, .read, .thread_members, .thread_joined, .thread_open, .threads_page, .conta => {},
             else => s.rev +%= 1,
         }
         switch (ev) {
@@ -1326,7 +1326,7 @@ pub const Store = struct {
                 } else try s.voice_flags.put(s.gpa, v.user, v.flags);
             },
             .voice_member_flags => |v| try s.voice_flags.put(s.gpa, v.user, v.flags),
-            .voice_ping, .voice_audio => {},
+            .stream_ended, .voice_ping, .voice_audio, .voice_video => {},
             // A call da DM acabou: ninguém mais está nela (por garantia, se
             // algum VOICE_STATE_UPDATE de saída se perdeu).
             .call => |cl| if (cl.ended) if (s.channel(cl.channel)) |cs| cs.voice_members.clearRetainingCapacity(),

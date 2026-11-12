@@ -79,6 +79,9 @@ O cliente oficial é um navegador inteiro disfarçado de app. No mesmo PC:
   com Atender e Recusar, um toque (mudo no Não perturbe ou numa conversa silenciada), a notificação do
   sistema e a barra de tarefas piscando, mesmo da bandeja. Botão direito no microfone ou no fone troca o
   dispositivo no meio da call; `Ctrl+Shift+M` muta e `Ctrl+Shift+D` ensurdece.
+- **Assistir a um stream**: um selo "LIVE" marca quem está na câmera ou compartilhando a tela pelo
+  Go Live (DMs, grupos e servidores); clique para assistir (dois cliques ou o botão do canto põem em
+  tela cheia). H.264 pelo FFmpeg; compartilhar a própria tela vem depois.
 - **Interações do Discord**: menu do botão direito em mensagens, usuários, canais e servidores;
   barra de ações ao passar o mouse; **responder** (com a "curvinha" e clique para pular até a
   original); **editar** (`↑` na caixa vazia edita a última); **excluir**; **reações**;

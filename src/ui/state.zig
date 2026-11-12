@@ -158,6 +158,9 @@ pub const Palette = struct {
     arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator),
 };
 
+/// Um stream de vídeo anunciado na call (op 12).
+pub const StreamInfo = struct { user: Id = 0, ssrc: u32 = 0, active: bool = false };
+
 pub const State = struct {
     gpa: std.mem.Allocator,
     guild: Id = 0,
@@ -185,6 +188,15 @@ pub const State = struct {
     /// O microfone ou a saída da call não abriram (a barra de voz avisa).
     voice_mic_failed: bool = false,
     voice_out_failed: bool = false,
+    /// Vídeo na call: quem está transmitindo (op 12) e qual stream assistimos.
+    streams: [16]StreamInfo = @splat(.{}),
+    n_streams: usize = 0,
+    watching: Id = 0,
+    /// O visualizador está aberto (mesmo antes do primeiro quadro).
+    stream_open: bool = false,
+    stream_fullscreen: bool = false,
+    /// Grade da call aberta (o chat e a lista de membros dão lugar a ela).
+    call_view: bool = false,
     muted: bool = false,
     deafened: bool = false,
     collapsed: std.AutoHashMapUnmanaged(Id, void) = .empty,
@@ -261,6 +273,50 @@ pub const State = struct {
     }
 
     /// Aviso rápido no topo, nos dois idiomas: showToast(now, false, "copiado ✓", "copied ✓", .{}).
+    /// Atualiza (ou acrescenta) o vídeo de alguém. `active=false` desliga e,
+    /// se era o que assistíamos, fecha o visualizador.
+    pub fn setStream(s: *State, user: Id, ssrc: u32, active: bool) void {
+        if (user == 0) return;
+        for (s.streams[0..s.n_streams]) |*x| {
+            if (x.user != user) continue;
+            x.active = active and ssrc != 0;
+            if (ssrc != 0) x.ssrc = ssrc;
+            if (!x.active and s.watching == user) s.stopWatching();
+            return;
+        }
+        if (!active or ssrc == 0 or s.n_streams == s.streams.len) return;
+        s.streams[s.n_streams] = .{ .user = user, .ssrc = ssrc, .active = true };
+        s.n_streams += 1;
+    }
+
+    pub fn removeStream(s: *State, user: Id) void {
+        var i: usize = 0;
+        while (i < s.n_streams) : (i += 1) {
+            if (s.streams[i].user != user) continue;
+            var k = i;
+            while (k + 1 < s.n_streams) : (k += 1) s.streams[k] = s.streams[k + 1];
+            s.n_streams -= 1;
+            if (s.watching == user) s.stopWatching();
+            return;
+        }
+    }
+
+    pub fn streamOf(s: *const State, user: Id) ?StreamInfo {
+        for (s.streams[0..s.n_streams]) |x| if (x.user == user and x.active) return x;
+        return null;
+    }
+
+    pub fn stopWatching(s: *State) void {
+        s.watching = 0;
+        s.stream_open = false;
+        s.stream_fullscreen = false;
+    }
+
+    pub fn clearStreams(s: *State) void {
+        s.n_streams = 0;
+        s.stopWatching();
+    }
+
     pub fn showToast(s: *State, now_ms: i64, is_error: bool, comptime pt: []const u8, comptime en: []const u8, args: anytype) void {
         const out = i18n.fmt(&s.toast.buf, pt, en, args);
         s.toast.len = out.len;
