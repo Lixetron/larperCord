@@ -488,6 +488,8 @@ pub const Action = union(enum) {
     set_voice_mute: struct { user: Id, mute: bool },
     /// Abre/fecha o mixer de voz (a lista de quem está na call com volumes).
     toggle_voice_mixer,
+    /// Abre/fecha o chat do canal de voz ao lado da grade da call.
+    toggle_call_chat,
     /// Assiste ao vídeo de alguém (0 = fecha o visualizador).
     watch_stream: Id,
     /// Call na DM ou grupo: começa (ou entra na que já existe), atende e

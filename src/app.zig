@@ -1411,7 +1411,7 @@ pub const App = struct {
     /// rascunho do novo volta para a caixa (uma edição em andamento é cancelada).
     fn syncDraft(app: *App) void {
         const st = &app.st;
-        const ch = st.activeChannel() orelse 0;
+        const ch = st.composeChannel() orelse 0;
         if (!st.drafts.switchTo(app.gpa, ch, &st.input, st.editing == 0)) return;
         st.input_sync = true;
         st.editing = 0;
@@ -1422,7 +1422,7 @@ pub const App = struct {
     /// Depois de editar uma mensagem, a caixa volta com o rascunho do canal.
     fn restoreDraft(app: *App) void {
         const st = &app.st;
-        const text = if (st.activeChannel()) |ch| st.drafts.get(ch) orelse "" else "";
+        const text = if (st.composeChannel()) |ch| st.drafts.get(ch) orelse "" else "";
         const n = @min(text.len, st.input.len - 1);
         @memcpy(st.input[0..n], text[0..n]);
         @memset(st.input[n..], 0);
@@ -1717,7 +1717,7 @@ pub const App = struct {
                 defer app.gpa.free(text);
                 // "/nome" de um plugin: roda aqui e não vai para o Discord.
                 if (app.plugins.command(text)) return;
-                const ch = st.activeChannel() orelse return;
+                const ch = st.composeChannel() orelse return;
                 // Não dá para mandar agora: o texto continua na caixa.
                 if (!app.sendAllowed(ch)) return app.keepDraft(text);
                 // O que foi escolhido na lista vira a menção exata (pelo ID).
@@ -1756,7 +1756,7 @@ pub const App = struct {
                 // Não cabe na caixa: editar cortaria o fim da mensagem para sempre.
                 if (text.len >= st.input.len) return st.showToast(now(), true, "mensagem longa demais para editar aqui", "message too long to edit here", .{});
                 // O que estava sendo escrito fica guardado durante a edição.
-                if (st.editing == 0) if (st.activeChannel()) |ch| st.drafts.put(app.gpa, ch, std.mem.sliceTo(&st.input, 0));
+                if (st.editing == 0) if (st.composeChannel()) |ch| st.drafts.put(app.gpa, ch, std.mem.sliceTo(&st.input, 0));
                 @memcpy(st.input[0..text.len], text);
                 st.input[text.len] = 0;
                 st.editing = id;
@@ -1892,6 +1892,7 @@ pub const App = struct {
                     if (cs.info.kind != .voice) return;
                     st.voice = ch;
                     st.call_view = true;
+                    st.call_chat = false;
                     st.voice_guild = cs.info.guild;
                     st.voice_status = .connecting;
                     st.voice_mixer = false;
@@ -1902,6 +1903,7 @@ pub const App = struct {
             },
             .leave_voice => {
                 st.call_view = false;
+                st.call_chat = false;
                 if (st.voice != null) voz_audio.play(.leave);
                 app.resetCallState();
                 st.voice = null;
@@ -1921,6 +1923,11 @@ pub const App = struct {
                 if (st.voice != null) app.cmd(.{ .voice_flags = .{ .mute = st.muted, .deaf = st.deafened } });
             },
             .toggle_voice_mixer => st.voice_mixer = !st.voice_mixer,
+            .toggle_call_chat => {
+                if (st.voice == null) return;
+                st.call_chat = !st.call_chat;
+                st.call_view = true;
+            },
             .watch_stream => |u| {
                 const camera = app.st.streamOf(u) != null or app.store.voiceFlags(u).camera;
                 const live = app.store.voiceFlags(u).stream;
@@ -2167,6 +2174,7 @@ pub const App = struct {
                     app.resetCallState();
                     app.st.voice = null;
                     app.st.call_view = false;
+                    app.st.call_chat = false;
                     app.st.voice_status = .disconnected;
                     app.st.voice_mixer = false;
                 }

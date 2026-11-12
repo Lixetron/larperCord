@@ -286,7 +286,7 @@ fn contextGuild(ctx: *d.Ctx, target: Id) Id {
         const f = ctx.store.findAny(target) orelse return 0;
         return f.cs.info.guild;
     }
-    const ch = ctx.st.activeChannel() orelse return 0;
+    const ch = ctx.st.composeChannel() orelse return 0;
     const cs = ctx.store.channel(ch) orelse return 0;
     return cs.info.guild;
 }

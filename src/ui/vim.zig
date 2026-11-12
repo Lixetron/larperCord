@@ -81,7 +81,7 @@ pub fn keys(ctx: *d.Ctx) void {
 fn scroll(ctx: *d.Ctx, dy: f32) void {
     const st = ctx.st;
     if (st.friends) return;
-    const sc = st.scrollOf(st.activeChannel() orelse return);
+    const sc = st.scrollOf(st.composeChannel() orelse return);
     if (sc.pos < 0) return;
     // Colado no fim, o alvo já é o fim; descer não faz nada.
     if (dy > 0 and sc.stick_bottom) return;
@@ -92,7 +92,7 @@ fn scroll(ctx: *d.Ctx, dy: f32) void {
 fn edge(ctx: *d.Ctx, top: bool) void {
     const st = ctx.st;
     if (st.friends) return;
-    const id = st.activeChannel() orelse return;
+    const id = st.composeChannel() orelse return;
     const sc = st.scrollOf(id);
     if (!top) return ctx.act(.{ .jump_present = id });
     sc.stick_bottom = false;

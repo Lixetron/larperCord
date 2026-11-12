@@ -13,6 +13,11 @@ const w = @import("widgets.zig");
 const qa = @import("qa.zig");
 const anim = @import("anim.zig");
 const i18n = @import("i18n.zig");
+const icons = @import("icons.zig");
+const devices = @import("device_menu.zig");
+const kdl = @import("../theme/kdl.zig");
+const layout = @import("../theme/layout.zig");
+const msgs = @import("comp_messages.zig");
 const types = @import("../core/types.zig");
 const voz_video = @import("../net/voz_video.zig");
 
@@ -267,7 +272,7 @@ fn drawTiles(ctx: *d.Ctx, area: d.Rect) void {
         if (ctx.store.isSpeaking(uid, ctx.now_ms)) {
             d.border(dl, tile, d.Rgba.hex(0x23a55a), 4, 2);
         }
-        const hr = d.hit(ctx, @as(usize, 10 + i), tile);
+        const hr = d.hitUnder(ctx, @as(usize, 10 + i), tile);
         const f = ctx.store.voiceFlags(uid);
         // O SSRC pode ainda não existir (a conexão do Go Live nasce ao clicar):
         // o clique vale mesmo assim.
@@ -276,12 +281,184 @@ fn drawTiles(ctx: *d.Ctx, area: d.Rect) void {
     }
 }
 
+/// A área que a grade toma quando se entra num canal de voz: as mensagens, a
+/// caixa de texto, a lista de membros e o cabeçalho da conversa. As abas só
+/// entram quando ficam dentro dessa coluna (no rodapé, por exemplo, ficam de
+/// fora, e continuam à vista).
+pub const CallArea = struct { rect: d.Rect, tabs: bool };
+
+pub fn callArea(placed: []const layout.Placed) ?CallArea {
+    var area: ?d.Rect = null;
+    var tabs: ?d.Rect = null;
+    for (placed) |p| {
+        if (p.kind != .component) continue;
+        const name = p.node.name;
+        if (std.mem.eql(u8, name, "messages") or
+            std.mem.eql(u8, name, "composer") or
+            std.mem.eql(u8, name, "member-list") or
+            std.mem.eql(u8, name, "header"))
+        {
+            area = if (area) |a| unionRect(a, p.rect) else p.rect;
+        } else if (std.mem.eql(u8, name, "tabs")) tabs = p.rect;
+    }
+    const a = area orelse return null;
+    if (tabs) |tr| if (tr.x >= a.x - 0.5 and tr.right() <= a.right() + 0.5)
+        return .{ .rect = unionRect(a, tr), .tabs = true };
+    return .{ .rect = a, .tabs = false };
+}
+
+fn unionRect(a: d.Rect, b: d.Rect) d.Rect {
+    const x = @min(a.x, b.x);
+    const y = @min(a.y, b.y);
+    return .{ .x = x, .y = y, .w = @max(a.right(), b.right()) - x, .h = @max(a.bottom(), b.bottom()) - y };
+}
+
+/// Largura que o chat do canal de voz pede numa área de `area_w` pixels.
+pub fn chatWidth(area_w: f32, saved: i16) f32 {
+    const lim = chatLimits(area_w);
+    if (saved > 0) return std.math.clamp(@as(f32, @floatFromInt(saved)), @as(f32, @floatFromInt(lim[0])), @as(f32, @floatFromInt(lim[1])));
+    return @min(@min(400, @max(320, area_w * 0.33)), @max(area_w - 240, 140));
+}
+
+/// Os limites da alça do chat: a grade continua com espaço para as placas.
+pub fn chatLimits(area_w: f32) [2]i16 {
+    const hi_f: f32 = @max(@min(area_w - 120, 700), 160);
+    const hi: i16 = @intFromFloat(hi_f);
+    const lo: i16 = @intFromFloat(@min(200, hi_f));
+    return .{ lo, hi };
+}
+
 /// A grade embutida no lugar do chat e da lista de membros: é o que se vê ao
-/// entrar num canal de voz, como no cliente oficial.
-pub fn embedded(ctx: *d.Ctx, area: d.Rect) void {
+/// entrar num canal de voz, como no cliente oficial. Com o chat do canal
+/// aberto, a grade divide o espaço com ele.
+pub fn embedded(ctx: *d.Ctx, area: d.Rect, msg_node: ?*const kdl.Node, comp_node: ?*const kdl.Node, comp_h: f32) void {
+    if (!ctx.st.call_chat or ctx.st.voice == null) return embeddedGrid(ctx, area);
+    // O mesmo desenho do Discord: a grade fica com o resto e o chat com uma
+    // faixa à direita, sem chegar a espremer os participantes.
+    const gap: f32 = 0;
+    const chat_w = chatWidth(area.w, ctx.st.call_chat_w);
+    const grid_area: d.Rect = .{ .x = area.x, .y = area.y, .w = @max(area.w - chat_w - gap, 120), .h = area.h };
+    const chat_area: d.Rect = .{ .x = grid_area.right() + gap, .y = area.y, .w = @max(area.right() - grid_area.right() - gap, 100), .h = area.h };
+    embeddedGrid(ctx, grid_area);
+    chatPanel(ctx, chat_area, msg_node, comp_node, comp_h);
+}
+
+fn embeddedGrid(ctx: *d.Ctx, area: d.Rect) void {
     qa.mark(area, "stream-grid", .{});
     d.rect(ctx.dl, area, ctx.col(.bg), 0);
+    // O botão do chat fica no canto de cima, por cima da primeira placa. O
+    // clique é pedido antes das placas: a placa de baixo não rouba o botão.
+    const side: f32 = 30;
+    const br: d.Rect = .{ .x = area.right() - side - 8, .y = area.y + 8, .w = side, .h = side };
+    qa.mark(br, "stream-chat-toggle", .{});
+    const hb = d.hit(ctx, 0xCA11_0A7, br);
     drawTiles(ctx, area.inset(8, 8));
+    const on = ctx.st.call_chat;
+    d.shadow(ctx.dl, br, 8, 8, ctx.col(.shadow).alpha(0.5));
+    d.rect(ctx.dl, br, if (on) ctx.col(.accent) else ctx.col(.overlay).mix(ctx.col(.bg), 0.15), 7);
+    if (hb.hovered and !on) d.rect(ctx.dl, br, ctx.col(.hover).alpha(0.5), 7);
+    icons.message(ctx.dl, br.x + side / 2, br.y + side / 2 - 1, (if (on) ctx.col(.accent_text) else if (hb.hovered) ctx.col(.text) else ctx.col(.muted)).u());
+    d.tip(ctx, br, if (on)
+        i18n.tr("Fechar o chat do canal de voz", "Hide the voice channel chat")
+    else
+        i18n.tr("Abrir o chat do canal de voz", "Show the voice channel chat"), hb.hovered);
+    if (hb.clicked) ctx.act(.toggle_call_chat);
+    // Por último, por cima das placas (elas usam `hitUnder`): a barra da call.
+    callBar(ctx, area);
+}
+
+/// A barra de controles da call, centrada embaixo na grade: microfone e fone
+/// juntos, com a setinha de cada um para o menu de dispositivos, e o botão
+/// vermelho de desconectar separado.
+const CallBar = struct { group: d.Rect, mic: d.Rect, deaf: d.Rect, hang: d.Rect };
+
+fn callBarRect(area: d.Rect) ?CallBar {
+    const pad: f32 = 4;
+    const unit_w: f32 = 52;
+    const group_h: f32 = 48;
+    const btn_h = group_h - pad * 2;
+    const gap: f32 = 10;
+    const hang_w: f32 = 64;
+    const group_w = pad * 2 + unit_w * 2;
+    const total = group_w + gap + hang_w;
+    if (area.w < total + 24 or area.h < 220) return null;
+    const group: d.Rect = .{
+        .x = area.x + (area.w - total) / 2,
+        .y = area.bottom() - group_h - 16,
+        .w = group_w,
+        .h = group_h,
+    };
+    const mic: d.Rect = .{ .x = group.x + pad, .y = group.y + pad, .w = unit_w, .h = btn_h };
+    const deaf: d.Rect = .{ .x = mic.right(), .y = mic.y, .w = unit_w, .h = btn_h };
+    const hang: d.Rect = .{ .x = group.right() + gap, .y = group.y, .w = hang_w, .h = group_h };
+    return .{ .group = group, .mic = mic, .deaf = deaf, .hang = hang };
+}
+
+fn callBar(ctx: *d.Ctx, area: d.Rect) void {
+    const b = callBarRect(area) orelse return;
+    const dl = ctx.dl;
+    qa.mark(b.mic, "call-mic", .{});
+    qa.mark(b.deaf, "call-deafen", .{});
+    qa.mark(b.hang, "call-hangup", .{});
+
+    d.shadow(dl, b.group, 14, 12, ctx.col(.shadow).alpha(0.55));
+    d.rect(dl, b.group, ctx.col(.elevated), 12);
+    d.border(dl, b.group, ctx.col(.border).alpha(0.7), 12, 1);
+    const fam = ctx.ui;
+    _ = devices.toggle(ctx, dl, fam.get(.bold), 14, .mic, b.mic, .icon, 0xCA11_0C0, "call-mic", true);
+    _ = devices.toggle(ctx, dl, fam.get(.bold), 14, .deaf, b.deaf, .icon, 0xCA11_0C2, "call-deafen", true);
+    // Os vãos entre os botões também seguram o clique: nada de abrir a placa.
+    _ = d.hit(ctx, 0xCA11_0C4, b.group);
+
+    const hh = d.hit(ctx, 0xCA11_0C5, b.hang);
+    d.shadow(dl, b.hang, 14, 12, ctx.col(.shadow).alpha(0.55));
+    d.rect(dl, b.hang, if (hh.hovered) ctx.col(.danger).mix(d.Rgba.white, 0.12) else ctx.col(.danger), 12);
+    icons.phone(dl, b.hang.x + b.hang.w / 2, b.hang.y + b.hang.h / 2 - 1, d.Rgba.white.u());
+    d.tip(ctx, b.hang, i18n.tr("Desconectar", "Disconnect"), hh.hovered);
+    if (hh.clicked) ctx.act(.leave_voice);
+}
+
+/// O chat de texto do canal de voz, à direita da grade: o mesmo histórico e a
+/// mesma caixa de texto da conversa normal, presos a este canal.
+fn chatPanel(ctx: *d.Ctx, area: d.Rect, msg_node: ?*const kdl.Node, comp_node: ?*const kdl.Node, comp_h: f32) void {
+    const vc = ctx.st.voice orelse return;
+    const cs = ctx.store.channel(vc) orelse return;
+    const dl = ctx.dl;
+    const fam = ctx.ui;
+    qa.mark(area, "stream-chat", .{});
+    d.rect(dl, area, ctx.col(.bg), 0);
+    d.line(dl, area.x - 0.5, area.y, area.x - 0.5, area.bottom(), ctx.col(.border), 1);
+
+    const head_h: f32 = 40;
+    icons.message(dl, area.x + 20, area.y + head_h / 2, ctx.col(.muted).u());
+    _ = d.textClipped(dl, fam.get(.semibold), 14, area.x + 36, area.y + (head_h - 14) / 2, ctx.col(.text), cs.info.name, area.w - 76);
+
+    const xr: d.Rect = .{ .x = area.right() - 32, .y = area.y + 9, .w = 22, .h = 22 };
+    qa.mark(xr, "stream-chat-close", .{});
+    const hx = d.hit(ctx, 0xCA11_0A8, xr);
+    if (hx.hovered) d.rect(dl, xr, ctx.col(.hover), 4);
+    const ink = if (hx.hovered) ctx.col(.text) else ctx.col(.muted);
+    d.line(dl, xr.x + 6, xr.y + 6, xr.right() - 6, xr.bottom() - 6, ink, 1.6);
+    d.line(dl, xr.right() - 6, xr.y + 6, xr.x + 6, xr.bottom() - 6, ink, 1.6);
+    d.tip(ctx, xr, i18n.tr("Fechar o chat", "Hide chat"), hx.hovered);
+    if (hx.clicked) ctx.act(.toggle_call_chat);
+    d.line(dl, area.x, area.y + head_h - 0.5, area.right(), area.y + head_h - 0.5, ctx.col(.border), 1);
+
+    const comp_space = if (comp_node != null) @max(comp_h, 1) else 0;
+    const comp_top = area.bottom() - comp_space;
+    const hist: d.Rect = .{
+        .x = area.x,
+        .y = area.y + head_h,
+        .w = area.w,
+        .h = @max(20, comp_top - (area.y + head_h) - msgs.composer_extra),
+    };
+    if (msg_node) |n| msgs.history(ctx, n, hist, vc, "##voice-chat");
+    if (comp_node) |n| msgs.composer(ctx, n, .{
+        .x = area.x + 8,
+        .y = comp_top,
+        .w = @max(area.w - 16, 20),
+        .h = comp_space,
+    });
 }
 
 fn single(ctx: *d.Ctx) void {

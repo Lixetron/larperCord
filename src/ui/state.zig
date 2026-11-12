@@ -197,6 +197,10 @@ pub const State = struct {
     stream_fullscreen: bool = false,
     /// Grade da call aberta (o chat e a lista de membros dão lugar a ela).
     call_view: bool = false,
+    /// Chat do canal de voz aberto ao lado da grade (botão no canto dela).
+    call_chat: bool = false,
+    /// Largura do chat do canal de voz em pixels (0 = a proporção do padrão).
+    call_chat_w: i16 = 0,
     muted: bool = false,
     deafened: bool = false,
     collapsed: std.AutoHashMapUnmanaged(Id, void) = .empty,
@@ -257,6 +261,13 @@ pub const State = struct {
 
     pub fn activeChannel(s: *const State) ?Id {
         return if (s.tab < s.tabs.items.len) s.tabs.items[s.tab] else null;
+    }
+
+    /// Onde a caixa de texto fala agora: o chat do canal de voz, quando ele está
+    /// aberto ao lado da grade, ou o canal da aba ativa.
+    pub fn composeChannel(s: *const State) ?Id {
+        if (s.call_view and s.call_chat) return s.voice;
+        return s.activeChannel();
     }
 
     /// GIFs e emojis animados tocam sozinhos só com a janela em foco, como no

@@ -478,7 +478,7 @@ pub fn history(ctx: *d.Ctx, n: *const kdl.Node, r: d.Rect, ch_id: Id, region: [*
     // Lendo o passado, perto do fim do que está carregado: pede as seguintes.
     if (cs.detached and cs.newer == .idle and ctx.now_ms >= cs.newer_retry_ms and msgs.len > 0 and sc.pos >= max_scroll - r.h * 0.6 - 200) ctx.act(.{ .load_newer = ch_id });
     // Pulo para uma mensagem (clique numa resposta): só no painel focado.
-    if (st.jump != 0 and st.activeChannel() == ch_id) {
+    if (st.jump != 0 and st.composeChannel() == ch_id) {
         const found = for (msgs, 0..) |m, i| {
             if (m.msg.id != st.jump) continue;
             sc.target = std.math.clamp(st.offsets.items[i] - r.h / 3, 0, max_scroll);
@@ -525,7 +525,7 @@ pub fn history(ctx: *d.Ctx, n: *const kdl.Node, r: d.Rect, ch_id: Id, region: [*
     // No fim da conversa (no presente) com a janela em foco: lida de verdade.
     // Fora disso, o que chegou fica não lido e a linha marca onde começa.
     if (cs.info.unread) {
-        const at_present = sc.stick_bottom and !cs.detached and !cs.cached and !cs.pos_unread and cs.around != .loading and (st.jump == 0 or st.activeChannel() != ch_id);
+        const at_present = sc.stick_bottom and !cs.detached and !cs.cached and !cs.pos_unread and cs.around != .loading and (st.jump == 0 or st.composeChannel() != ch_id);
         if (at_present and st.window_focused and !cs.hold_unread) {
             ctx.act(.{ .channel_seen = ch_id });
         } else if (cs.divider_after == 0) {
@@ -1653,7 +1653,7 @@ const composer_max_lines = 10;
 
 pub fn composer(ctx: *d.Ctx, n: *const kdl.Node, r_in: d.Rect) void {
     if (ctx.st.friends) return;
-    const ch_id = ctx.st.activeChannel() orelse return;
+    const ch_id = ctx.st.composeChannel() orelse return;
     const cs = ctx.store.channel(ch_id) orelse return;
     // Entrou, mas o servidor pede as regras antes: o motivo e o botão delas (ui/entrada.zig).
     if (ctx.store.isPending(cs.info.guild)) {

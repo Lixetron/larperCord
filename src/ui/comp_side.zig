@@ -383,7 +383,7 @@ pub fn statusBar(ctx: *d.Ctx, n: *const kdl.Node, r: d.Rect) void {
                 const kind: devices.Kind = if (s.item == .mic) .mic else .deaf;
                 const br: d.Rect = .{ .x = sr.x + sp, .y = sr.y + (if (tty) @as(f32, 0) else @max((sr.h - 28) / 2, 0)), .w = s.w, .h = if (tty) sr.h else @min(sr.h, 28) };
                 qa.mark(br, "status-{s}", .{@tagName(s.item)});
-                if (devices.toggle(ctx, dl, font, fs, kind, br, if (tty) .tty else .icon, 0x400 + i, if (kind == .mic) "status-mic" else "status-deaf"))
+                if (devices.toggle(ctx, dl, font, fs, kind, br, if (tty) .tty else .icon, 0x400 + i, if (kind == .mic) "status-mic" else "status-deaf", false))
                     qa.mark(br, "status-forced:{s}", .{@tagName(s.item)});
                 if (tty and i + 1 < count) d.text(dl, font, fs, sr.right() - 3, d.centerY(sr, fs), ctx.col(.faint), "│");
                 continue;

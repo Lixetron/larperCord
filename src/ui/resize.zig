@@ -17,6 +17,7 @@ const S = @import("settings_state.zig");
 const dropdown = @import("dropdown.zig");
 const search = @import("search.zig");
 const plugin_panel = @import("plugin_panel.zig");
+const stream = @import("stream.zig");
 
 /// A conversa nunca fica mais estreita que isto por causa de um painel alargado.
 pub const min_chat: f32 = 360;
@@ -94,9 +95,17 @@ pub fn addPanels(ctx: *d.Ctx, placed: []const layout.Placed, shown: []const layo
     qa.mark(.{ .x = 0, .y = 0, .w = main, .h = 1 }, "main-area", .{});
     const room = @max(main - min_chat, 0);
     const s = &ctx.st.settings;
+    // Grade da call no lugar da conversa e da lista de membros: a alça da
+    // lista de membros não tem o que redimensionar. Com o chat do canal de
+    // voz aberto, a alça passa a ser dele.
+    const call_space = if (ctx.st.call_view and ctx.st.voice != null and !ctx.st.settings.open and !ctx.st.stream_open)
+        stream.callArea(placed)
+    else
+        null;
     for (placed) |p| {
         const h = p.handle orelse continue;
         const channels = h.size == 0;
+        if (call_space != null and !channels) continue;
         const now: i16 = @intFromFloat(shown[h.size].delta);
         const lo = if (channels) channels_lo else members_lo;
         const hi = if (channels) channels_hi else members_hi;
@@ -114,6 +123,23 @@ pub fn addPanels(ctx: *d.Ctx, placed: []const layout.Placed, shown: []const layo
             .per_px = if (h.side == .right) 1 else -1,
         });
     }
+    if (call_space) |ca| if (ctx.st.call_chat) {
+        const a = ca.rect;
+        const hands = stream.chatLimits(a.w);
+        const width = stream.chatWidth(a.w, ctx.st.call_chat_w);
+        add(.{
+            .name = "##resize:call-chat",
+            .x = a.right() - width,
+            .y = a.y,
+            .h = a.h,
+            .value = &ctx.st.call_chat_w,
+            .shown = @intFromFloat(width),
+            .default = 0,
+            .lo = hands[0],
+            .hi = hands[1],
+            .per_px = -1,
+        });
+    };
 }
 
 /// Desenha as alças pedidas neste quadro.

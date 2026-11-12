@@ -139,7 +139,7 @@ fn centered(ctx: *d.Ctx, dl: *c.ImDrawList, area: d.Rect, y: f32, msg: []const u
 /// O corpo da aba, de `top` até o fim do seletor `r`. `q` filtra pelo nome.
 pub fn body(ctx: *d.Ctx, r: d.Rect, top: f32, q: []const u8, appearing: bool) void {
     const store = ctx.store;
-    const ch_id = ctx.st.activeChannel() orelse return;
+    const ch_id = ctx.st.composeChannel() orelse return;
     const cs = store.channel(ch_id) orelse return;
     const book = &store.stickers;
     // Os pacotes padrão só vêm quando a aba abre (uma vez por sessão).

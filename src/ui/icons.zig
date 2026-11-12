@@ -32,6 +32,14 @@ pub fn headset(dl: *c.ImDrawList, cx: f32, cy: f32, col: u32) void {
     c.ImDrawList_AddRectFilledEx(dl, v(cx + 5, cy), v(cx + 9, cy + 8), col, 2, 0);
 }
 
+/// Telefone de "encerrar a chamada": o fone deitado, com as duas pontas.
+pub fn phone(dl: *c.ImDrawList, cx: f32, cy: f32, col: u32) void {
+    const th: f32 = 3.2;
+    arc(dl, cx, cy + 1, 6, pi, 2 * pi, col, th);
+    c.ImDrawList_AddRectFilledEx(dl, v(cx - 8.5, cy - 1.5), v(cx - 4.5, cy + 5), col, 2.2, 0);
+    c.ImDrawList_AddRectFilledEx(dl, v(cx + 4.5, cy - 1.5), v(cx + 8.5, cy + 5), col, 2.2, 0);
+}
+
 pub fn gear(dl: *c.ImDrawList, cx: f32, cy: f32, col: u32) void {
     var i: usize = 0;
     while (i < 8) : (i += 1) {

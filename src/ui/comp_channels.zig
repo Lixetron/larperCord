@@ -583,7 +583,7 @@ pub fn userPanel(ctx: *d.Ctx, n: *const kdl.Node, r: d.Rect) void {
         bx -= bw;
         const br: d.Rect = .{ .x = bx, .y = gr.y, .w = bw, .h = bs };
         qa.mark(br, "user-btn:{d}", .{i});
-        if (devices.toggle(ctx, ctx.dl, fam.get(.bold), btn_fs, kind, br, look, 10 + i, if (i == 0) "user-btn:0" else "user-btn:1"))
+        if (devices.toggle(ctx, ctx.dl, fam.get(.bold), btn_fs, kind, br, look, 10 + i, if (i == 0) "user-btn:0" else "user-btn:1", false))
             qa.mark(br, "user-forced:{d}", .{i});
     }
     const hb = d.hit(ctx, 12, gr);

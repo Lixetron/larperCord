@@ -96,12 +96,6 @@ fn hidden(ctx: *d.Ctx, name: []const u8) bool {
     return false;
 }
 
-fn unionRect(a: d.Rect, b: d.Rect) d.Rect {
-    const x = @min(a.x, b.x);
-    const y = @min(a.y, b.y);
-    return .{ .x = x, .y = y, .w = @max(a.right(), b.right()) - x, .h = @max(a.bottom(), b.bottom()) - y };
-}
-
 pub fn frame(ctx: *d.Ctx, placed: *std.ArrayList(layout.Placed), previews: []const Preview) void {
     const vp = c.ImGui_GetMainViewport();
     c.ImGui_SetNextWindowPos(vp.*.Pos, 0);
@@ -136,7 +130,12 @@ pub fn frame(ctx: *d.Ctx, placed: *std.ArrayList(layout.Placed), previews: []con
     // no lugar das mensagens e da lista de membros, como no cliente oficial.
     // Escolher uma conversa na lista lateral devolve o chat.
     const call = ctx.st.call_view and ctx.st.voice != null and !ctx.st.stream_open and !ctx.st.settings.open;
-    var call_area: ?d.Rect = null;
+    var call_space: ?@import("stream.zig").CallArea = null;
+    // Os nós do tema que a grade esconde: o chat ao lado dela usa as mesmas
+    // regras (fonte, avatares, variante) da conversa normal.
+    var call_messages: ?*const kdl.Node = null;
+    var call_composer: ?*const kdl.Node = null;
+    var call_composer_h: f32 = 0;
     if (ctx.th.layout) |root| {
         const Look = struct {
             fn get(p: *const anyopaque, name: []const u8) ?bool {
@@ -161,6 +160,7 @@ pub fn frame(ctx: *d.Ctx, placed: *std.ArrayList(layout.Placed), previews: []con
         var sizes = resize.sizes(&ctx.st.settings);
         layout.solveSized(ctx.st.gpa, root, bounds, bounds.w, .{ .ctx = ctx.th, .get = Look.get, .hides = hides[0..n_hides] }, &sizes, "messages", resize.min_chat, placed) catch {};
         resize.addPanels(ctx, placed.items, &sizes);
+        if (call) call_space = @import("stream.zig").callArea(placed.items);
         const base_theme = ctx.th;
         defer ctx.th = base_theme;
         var local: theme_mod.Theme = undefined;
@@ -179,12 +179,20 @@ pub fn frame(ctx: *d.Ctx, placed: *std.ArrayList(layout.Placed), previews: []con
             // Primitivas novas no próprio nó (gradiente, grão, borda por lado…).
             if (base_theme.nodeFx(p.node)) |x| fx.node(ctx, x, p.node, p.rect, i);
             if (p.kind != .component or hidden(ctx, p.node.name)) continue;
-            if (call and (std.mem.eql(u8, p.node.name, "messages") or
-                std.mem.eql(u8, p.node.name, "composer") or
-                std.mem.eql(u8, p.node.name, "member-list")))
-            {
-                call_area = if (call_area) |a| unionRect(a, p.rect) else p.rect;
-                continue;
+            if (call_space) |ca| {
+                if (std.mem.eql(u8, p.node.name, "messages") or
+                    std.mem.eql(u8, p.node.name, "composer") or
+                    std.mem.eql(u8, p.node.name, "member-list") or
+                    std.mem.eql(u8, p.node.name, "header") or
+                    (ca.tabs and std.mem.eql(u8, p.node.name, "tabs")))
+                {
+                    if (std.mem.eql(u8, p.node.name, "messages")) call_messages = p.node;
+                    if (std.mem.eql(u8, p.node.name, "composer")) {
+                        call_composer = p.node;
+                        call_composer_h = p.rect.h;
+                    }
+                    continue;
+                }
             }
             c.ImGui_PushIDPtr(p.node);
             defer c.ImGui_PopID();
@@ -199,7 +207,7 @@ pub fn frame(ctx: *d.Ctx, placed: *std.ArrayList(layout.Placed), previews: []con
         }
     }
     // Por cima dos painéis, por baixo do que flutua (a lista do autocompletar).
-    if (call) if (call_area) |a| @import("stream.zig").embedded(ctx, a);
+    if (call_space) |ca| @import("stream.zig").embedded(ctx, ca.rect, call_messages, call_composer, call_composer_h);
     resize.submit(ctx);
     plugin_panel.draw(ctx);
     @import("lsp_ui.zig").panel(ctx);

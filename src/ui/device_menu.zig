@@ -250,8 +250,9 @@ pub fn ttyWidth(font: *c.ImFont, fs: f32, kind: Kind, look: Look) f32 {
 
 /// Mudo (`mic`) ou ensurdecer (`deaf`) em `br`: clicar alterna; o botão direito
 /// ou a setinha da direita abrem o menu de dispositivos. Usa os ids `id` e
-/// `id + 1000` de `d.hit`. Devolve se quem impôs foi o servidor (o cadeado).
-pub fn toggle(ctx: *d.Ctx, dl: *c.ImDrawList, font: *c.ImFont, fs: f32, kind: Kind, br: d.Rect, look: Look, id: usize, tag: []const u8) bool {
+/// `id + 1000` de `d.hit`. `always_chev` deixa a setinha sempre à vista (na
+/// barra da call, como no Discord). Devolve se quem impôs foi o servidor (o cadeado).
+pub fn toggle(ctx: *d.Ctx, dl: *c.ImDrawList, font: *c.ImFont, fs: f32, kind: Kind, br: d.Rect, look: Look, id: usize, tag: []const u8, always_chev: bool) bool {
     const vf = ctx.store.voiceFlags(ctx.store.me);
     const forced = ctx.st.voice != null and switch (kind) {
         .mic => vf.serverMuted(),
@@ -300,8 +301,10 @@ pub fn toggle(ctx: *d.Ctx, dl: *c.ImDrawList, font: *c.ImFont, fs: f32, kind: Ki
         },
         .icon => {
             d.rect(dl, br, ctx.col(.hover).alpha(k * 1.5), ctx.th.radius);
-            // O ícone abre espaço para a setinha quando ela aparece.
-            const cx = br.x + (br.w - chev_w * k * 0.6) / 2;
+            // O ícone abre espaço para a setinha quando ela aparece (ou sempre,
+            // na barra da call).
+            const chev_show = if (always_chev) @as(f32, 1) else k * 0.6;
+            const cx = br.x + (br.w - chev_w * chev_show) / 2;
             switch (kind) {
                 .mic => icons.mic(dl, cx, cy, ink.u()),
                 .deaf => icons.headset(dl, cx, cy, ink.u()),
@@ -314,8 +317,8 @@ pub fn toggle(ctx: *d.Ctx, dl: *c.ImDrawList, font: *c.ImFont, fs: f32, kind: Ki
             }
         },
     }
-    if (k > 0.02) {
-        const cc = (if (ch.hovered or menu_open) ctx.col(.text) else ctx.col(.muted)).alpha(k);
+    if (always_chev or k > 0.02) {
+        const cc = if (ch.hovered or menu_open) ctx.col(.text) else if (always_chev) ctx.col(.muted) else ctx.col(.muted).alpha(k);
         icons.chevron(dl, cr.x + cr.w / 2 - 1, cy + (if (look == .icon) @as(f32, 3) else 0), cc.u(), 1);
     }
     return forced;

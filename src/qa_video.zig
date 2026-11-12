@@ -84,6 +84,59 @@ fn closed(app: *App) bool {
 fn gridOpen(_: *App) bool {
     return qa.find("stream-grid") != null;
 }
+fn noMemberHandle(_: *App) bool {
+    return qa.find("resize:members") == null and qa.find("resize:call-chat") == null;
+}
+fn chatOn(app: *App) bool {
+    return app.st.call_chat and qa.find("stream-grid") != null and qa.find("stream-chat") != null and qa.find("resize:call-chat") != null;
+}
+/// O grid e o chat se encostam, e o cabeçalho da conversa (busca, membros) não
+/// fica atrás do vão: nada de clicar no que está no outro nó.
+fn noSeam(_: *App) bool {
+    const g = qa.find("stream-grid") orelse return false;
+    const ch = qa.find("stream-chat") orelse return false;
+    return ch.x - g.right() <= 1 and qa.find("header-members") == null and qa.find("header-find") == null;
+}
+fn chatLoaded(app: *App) bool {
+    const cs = app.store.channel(call) orelse return false;
+    return app.st.call_chat and cs.history == .loaded and qa.find("stream-chat") != null;
+}
+fn chatOff(app: *App) bool {
+    return !app.st.call_chat and qa.find("stream-chat") == null and qa.find("stream-grid") != null;
+}
+fn chatWider(app: *App) bool {
+    return app.st.call_chat_w > 0 and qa.find("resize:call-chat") != null;
+}
+fn chatDefault(app: *App) bool {
+    return app.st.call_chat_w == 0 and qa.find("resize:call-chat") != null;
+}
+fn callControls(_: *App) bool {
+    return qa.find("call-mic") != null and qa.find("call-deafen") != null and qa.find("call-hangup") != null;
+}
+fn micMuted(app: *App) bool {
+    return app.st.muted;
+}
+fn micLive(app: *App) bool {
+    return !app.st.muted;
+}
+fn deafOn(app: *App) bool {
+    return app.st.deafened;
+}
+fn deafOff(app: *App) bool {
+    return !app.st.deafened;
+}
+fn micMenuOpen(app: *App) bool {
+    return app.st.popup == .devices;
+}
+fn outMenuOpen(app: *App) bool {
+    return switch (app.st.popup) {
+        .devices => |dv| dv.which == .out,
+        else => false,
+    };
+}
+fn menuClosed(app: *App) bool {
+    return app.st.popup == .none;
+}
 fn chatBack(_: *App) bool {
     return qa.find("stream-grid") == null;
 }
@@ -135,10 +188,6 @@ fn decoded(_: *App) bool {
     return decode_ok;
 }
 
-fn leave(app: *App) void {
-    app.handle(.leave_voice);
-}
-
 pub const ops = [_]Op{
     s("vídeo: decodificador"),
     run(decodeFile),
@@ -151,6 +200,42 @@ pub const ops = [_]Op{
     expect("o selo LIVE aparece para quem transmite", liveOn),
     shot("video-live"),
     run(backToCall),
+    expect("na grade sem o chat, a alça da lista de membros não aparece", noMemberHandle),
+    click("stream-chat-toggle"),
+    expect("o chat do canal de voz abre ao lado da grade", chatOn),
+    expect("grid e chat se encostam, sem a faixa do cabeçalho atrás", noSeam),
+    expectLong("o histórico do canal de voz carrega no painel", chatLoaded),
+    .{ .wait = 300 },
+    shot("video-chat"),
+    .{ .drag_by = .{ .from = .{ .mark = "resize:call-chat" }, .dx = -40 } },
+    expect("arrastar a alça alarga o chat do canal de voz", chatWider),
+    .{ .dclick = .{ .mark = "resize:call-chat" } },
+    expect("duplo clique devolve a largura do chat ao padrão", chatDefault),
+    click("stream-chat-close"),
+    expect("fechar o chat devolve a grade inteira", chatOff),
+    expect("a barra da call mostra microfone, áudio e desconectar", callControls),
+    click("call-mic-menu"),
+    expect("a setinha do microfone abre o menu de dispositivos", micMenuOpen),
+    .{ .wait = 300 },
+    shot("video-dispositivos"),
+    .{ .key = .{ .key = c.ImGuiKey_Escape } },
+    expect("Esc fecha o menu de dispositivos", menuClosed),
+    click("call-deafen-menu"),
+    expect("a setinha do fone abre a escolha de saída", outMenuOpen),
+    .{ .key = .{ .key = c.ImGuiKey_Escape } },
+    expect("Esc fecha a escolha de saída", menuClosed),
+    click("call-mic"),
+    expect("o microfone da barra silencia", micMuted),
+    click("call-mic"),
+    expect("o mesmo botão volta a ligar o microfone", micLive),
+    click("call-deafen"),
+    expect("o botão de áudio ensurdece", deafOn),
+    .{ .wait = 250 },
+    shot("video-controles"),
+    click("call-deafen"),
+    expect("o mesmo botão volta a ouvir", deafOff),
+    click("call-mic"),
+    expect("a barra deixa o microfone ligado de novo", micLive),
     run(watch),
     expect("abrir a janela de quem transmite", viewerOpen),
     expectLong("o padrão de teste chega à textura", gotFrame),
@@ -178,6 +263,6 @@ pub const ops = [_]Op{
     expect("fechar o Go Live", closed),
     .{ .wait = 200 },
     shot("video-depois"),
-    run(leave),
-    expect("sair da call", notInCall),
+    click("call-hangup"),
+    expect("o botão vermelho encerra a call", notInCall),
 };
