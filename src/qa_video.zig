@@ -62,9 +62,6 @@ fn goLiveOn(app: *App) void {
     app.events.push(.{ .voice_video = .{ .user = who, .video_ssrc = 0, .active = false } });
     app.events.push(.{ .voice_state = .{ .channel = call, .user = who, .flags = .{ .stream = true } } });
 }
-fn livePill(_: *App) bool {
-    return qa.find("voice-live:1001") != null;
-}
 fn liveOn(_: *App) bool {
     return qa.find("voice-live") != null;
 }
@@ -252,10 +249,9 @@ pub const ops = [_]Op{
     expect("escolher uma conversa volta para o chat", chatBack),
     expect("a call continua depois de fechar o vídeo", inCall),
 
-    s("vídeo: Go Live na faixa de voz"),
+    s("vídeo: Go Live"),
     run(goLiveOn),
     run(backToChat),
-    expect("o botão LIVE aparece na faixa da call", livePill),
     run(backToCall),
     run(watch),
     expect("a janela abre para o Go Live", viewerOpen),

@@ -52,6 +52,13 @@ fn volume(app: *App) f32 {
 fn muted(app: *App) bool {
     return app.st.volumes.isMuted(friend);
 }
+/// O selo de "silenciado para mim" ao lado do nome, na lista da call.
+fn iconMuted(_: *App) bool {
+    return qa.find("voice-muted-for-me:1001") != null;
+}
+fn iconGone(_: *App) bool {
+    return qa.find("voice-muted-for-me:1001") == null;
+}
 /// O volume que silenciar e tirar o silêncio não podem mudar: 57%, depois o do último
 /// arraste.
 var kept: f32 = 1.0;
@@ -201,12 +208,14 @@ pub const na_call = [_]Op{
     rclick("voice-member:500014:1001"),
     click("menu:Silenciar para mim"),
     expect("Silenciar para mim: sem som, e os 57% ficam guardados", mutedKept),
+    expect("silenciada: o selo de \"para mim\" aparece na lista da call", iconMuted),
     rclick("voice-member:500014:1001"),
     expect("silenciada: o visto em Silenciar para mim, e o controle mostra 57%", mutedChecked),
     expect("o volume e o silêncio vão e voltam pelo settings.kdl", persists),
     shot("voz-menu-volume-mudo"),
     click("menu:Silenciar para mim"),
     expect("tirar o silêncio pelo menu volta para 57%", unmutedKept),
+    expect("sem o silêncio, o selo de \"para mim\" some", iconGone),
     rclick("voice-member:500014:1001"),
     expect("sem o visto, e o controle em 57%", unmutedMenu),
     click("menu:Silenciar para mim"),

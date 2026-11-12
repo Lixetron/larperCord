@@ -90,6 +90,9 @@ fn updateTexture(ctx: *d.Ctx, ssrc: u32) ?[2]u32 {
     return .{ view.w, view.h };
 }
 
+/// Proporção das placas, como na grade do cliente oficial.
+const tile_aspect: f32 = 16.0 / 9.0;
+
 /// Colunas da grade: 1, 2, 2, 3, 3… como no cliente oficial.
 fn colsFor(n: usize) usize {
     return switch (n) {
@@ -205,8 +208,17 @@ fn drawTiles(ctx: *d.Ctx, area: d.Rect) void {
     const cols = colsFor(n);
     const rows = (n + cols - 1) / cols;
     const gap: f32 = 6;
-    const tw = (@max(area.w, 40) - gap * @as(f32, @floatFromInt(cols -| 1))) / @as(f32, @floatFromInt(cols));
-    const th = (@max(area.h, 40) - gap * @as(f32, @floatFromInt(rows -| 1))) / @as(f32, @floatFromInt(rows));
+    // As placas mantêm a proporção de vídeo e a grade inteira fica centrada na
+    // área, com as sobras em volta, como no Discord. Sem isto as placas
+    // esticavam até encher a área e ficavam quase quadradas.
+    const fit_w = (@max(area.w, 40) - gap * @as(f32, @floatFromInt(cols -| 1))) / @as(f32, @floatFromInt(cols));
+    const fit_h = (@max(area.h, 40) - gap * @as(f32, @floatFromInt(rows -| 1))) / @as(f32, @floatFromInt(rows)) * tile_aspect;
+    const tw = @min(fit_w, fit_h);
+    const th = tw / tile_aspect;
+    const grid_w = tw * @as(f32, @floatFromInt(cols)) + gap * @as(f32, @floatFromInt(cols -| 1));
+    const grid_h = th * @as(f32, @floatFromInt(rows)) + gap * @as(f32, @floatFromInt(rows -| 1));
+    const ox = area.x + (area.w - grid_w) / 2;
+    const oy = area.y + (area.h - grid_h) / 2;
 
     // A lista do que assistir: todos os que transmitem, no tamanho do tile.
     var reqs: [voz_video.max_watch]voz_video.WatchReq = undefined;
@@ -227,11 +239,14 @@ fn drawTiles(ctx: *d.Ctx, area: d.Rect) void {
     voz_video.setWatches(reqs[0..n_req]);
 
     for (ids[0..n], 0..) |uid, i| {
-        const cx = @as(usize, i % cols);
-        const cy = @as(usize, i / cols);
+        const col = @as(usize, i % cols);
+        const row = @as(usize, i / cols);
+        // A última linha incompleta também fica centrada, como no Discord.
+        const in_row = @min(cols, n - row * cols);
+        const row_w = tw * @as(f32, @floatFromInt(in_row)) + gap * @as(f32, @floatFromInt(in_row -| 1));
         const tile: d.Rect = .{
-            .x = area.x + @as(f32, @floatFromInt(cx)) * (tw + gap),
-            .y = area.y + @as(f32, @floatFromInt(cy)) * (th + gap),
+            .x = ox + (grid_w - row_w) / 2 + @as(f32, @floatFromInt(col)) * (tw + gap),
+            .y = oy + @as(f32, @floatFromInt(row)) * (th + gap),
             .w = tw,
             .h = th,
         };
@@ -346,23 +361,22 @@ pub fn embedded(ctx: *d.Ctx, area: d.Rect, msg_node: ?*const kdl.Node, comp_node
 fn embeddedGrid(ctx: *d.Ctx, area: d.Rect) void {
     qa.mark(area, "stream-grid", .{});
     d.rect(ctx.dl, area, ctx.col(.bg), 0);
-    // O botão do chat fica no canto de cima, por cima da primeira placa. O
-    // clique é pedido antes das placas: a placa de baixo não rouba o botão.
-    const side: f32 = 30;
-    const br: d.Rect = .{ .x = area.right() - side - 8, .y = area.y + 8, .w = side, .h = side };
-    qa.mark(br, "stream-chat-toggle", .{});
-    const hb = d.hit(ctx, 0xCA11_0A7, br);
-    drawTiles(ctx, area.inset(8, 8));
-    const on = ctx.st.call_chat;
-    d.shadow(ctx.dl, br, 8, 8, ctx.col(.shadow).alpha(0.5));
-    d.rect(ctx.dl, br, if (on) ctx.col(.accent) else ctx.col(.overlay).mix(ctx.col(.bg), 0.15), 7);
-    if (hb.hovered and !on) d.rect(ctx.dl, br, ctx.col(.hover).alpha(0.5), 7);
-    icons.message(ctx.dl, br.x + side / 2, br.y + side / 2 - 1, (if (on) ctx.col(.accent_text) else if (hb.hovered) ctx.col(.text) else ctx.col(.muted)).u());
-    d.tip(ctx, br, if (on)
-        i18n.tr("Fechar o chat do canal de voz", "Hide the voice channel chat")
-    else
-        i18n.tr("Abrir o chat do canal de voz", "Show the voice channel chat"), hb.hovered);
-    if (hb.clicked) ctx.act(.toggle_call_chat);
+    // O botão de abrir o chat fica no canto de cima, por cima da primeira placa.
+    // Com o chat aberto ele some: o × no cabeçalho do chat já fecha. O clique é
+    // pedido antes das placas: a placa de baixo não rouba o botão.
+    if (!ctx.st.call_chat) {
+        const side: f32 = 30;
+        const br: d.Rect = .{ .x = area.right() - side - 8, .y = area.y + 8, .w = side, .h = side };
+        qa.mark(br, "stream-chat-toggle", .{});
+        const hb = d.hit(ctx, 0xCA11_0A7, br);
+        drawTiles(ctx, area.inset(8, 8));
+        d.shadow(ctx.dl, br, 8, 8, ctx.col(.shadow).alpha(0.5));
+        d.rect(ctx.dl, br, ctx.col(.overlay).mix(ctx.col(.bg), 0.15), 7);
+        if (hb.hovered) d.rect(ctx.dl, br, ctx.col(.hover).alpha(0.5), 7);
+        icons.message(ctx.dl, br.x + side / 2, br.y + side / 2 - 1, (if (hb.hovered) ctx.col(.text) else ctx.col(.muted)).u());
+        d.tip(ctx, br, i18n.tr("Abrir o chat do canal de voz", "Show the voice channel chat"), hb.hovered);
+        if (hb.clicked) ctx.act(.toggle_call_chat);
+    } else drawTiles(ctx, area.inset(8, 8));
     // Por último, por cima das placas (elas usam `hitUnder`): a barra da call.
     callBar(ctx, area);
 }
@@ -413,7 +427,7 @@ fn callBar(ctx: *d.Ctx, area: d.Rect) void {
     const hh = d.hit(ctx, 0xCA11_0C5, b.hang);
     d.shadow(dl, b.hang, 14, 12, ctx.col(.shadow).alpha(0.55));
     d.rect(dl, b.hang, if (hh.hovered) ctx.col(.danger).mix(d.Rgba.white, 0.12) else ctx.col(.danger), 12);
-    icons.phone(dl, b.hang.x + b.hang.w / 2, b.hang.y + b.hang.h / 2 - 1, d.Rgba.white.u());
+    icons.hangup(dl, b.hang.x + b.hang.w / 2, b.hang.y + b.hang.h / 2 - 1, 7, d.Rgba.white.u());
     d.tip(ctx, b.hang, i18n.tr("Desconectar", "Disconnect"), hh.hovered);
     if (hh.clicked) ctx.act(.leave_voice);
 }

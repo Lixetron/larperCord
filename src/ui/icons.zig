@@ -26,18 +26,30 @@ pub fn mic(dl: *c.ImDrawList, cx: f32, cy: f32, col: u32) void {
     line(dl, cx - 3.5, cy + 9, cx + 3.5, cy + 9, col, 1.8);
 }
 
+/// Microfone com o selo de "silenciado para mim": o círculo cortado no canto
+/// de cima. `bg` apaga o pedaço do microfone que fica sob o selo.
+pub fn micMutedForMe(dl: *c.ImDrawList, cx: f32, cy: f32, col: u32, bg: u32) void {
+    mic(dl, cx - 1.5, cy + 1.5, col);
+    const bx = cx + 4;
+    const by = cy - 5.5;
+    const r: f32 = 4.6;
+    c.ImDrawList_AddCircleFilled(dl, v(bx, by), r + 0.8, bg, 0);
+    c.ImDrawList_AddCircleEx(dl, v(bx, by), r, col, 0, 1.3, 0);
+    const k = r * 0.66;
+    line(dl, bx - k, by - k, bx + k, by + k, col, 1.3);
+}
+
 pub fn headset(dl: *c.ImDrawList, cx: f32, cy: f32, col: u32) void {
     arc(dl, cx, cy + 1, 7.5, pi, 2 * pi, col, 1.9);
     c.ImDrawList_AddRectFilledEx(dl, v(cx - 9, cy), v(cx - 5, cy + 8), col, 2, 0);
     c.ImDrawList_AddRectFilledEx(dl, v(cx + 5, cy), v(cx + 9, cy + 8), col, 2, 0);
 }
 
-/// Telefone de "encerrar a chamada": o fone deitado, com as duas pontas.
-pub fn phone(dl: *c.ImDrawList, cx: f32, cy: f32, col: u32) void {
-    const th: f32 = 3.2;
-    arc(dl, cx, cy + 1, 6, pi, 2 * pi, col, th);
-    c.ImDrawList_AddRectFilledEx(dl, v(cx - 8.5, cy - 1.5), v(cx - 4.5, cy + 5), col, 2.2, 0);
-    c.ImDrawList_AddRectFilledEx(dl, v(cx + 4.5, cy - 1.5), v(cx + 8.5, cy + 5), col, 2.2, 0);
+/// X de "sair da call": o mesmo do painel do usuário e da barra da call.
+pub fn hangup(dl: *c.ImDrawList, cx: f32, cy: f32, r: f32, col: u32) void {
+    const th: f32 = 2.2;
+    line(dl, cx - r, cy - r, cx + r, cy + r, col, th);
+    line(dl, cx + r, cy - r, cx - r, cy + r, col, th);
 }
 
 pub fn gear(dl: *c.ImDrawList, cx: f32, cy: f32, col: u32) void {

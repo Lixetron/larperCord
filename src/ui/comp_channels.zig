@@ -361,7 +361,8 @@ fn row(ctx: *d.Ctx, dl: *c.ImDrawList, fam: *d.Family, variant: Variant, cs: any
             qa.mark(vr, "voice-member:{d}:{d}", .{ ch.id, uid });
             if (speaking) qa.mark(vr, "voice-speaking:{d}", .{uid});
             if (vf.muted()) qa.mark(vr, "voice-flagged:{d}", .{uid});
-            if (voiceFlagsTip(vf)) |vt| d.tip(ctx, vr, vt, vh.hovered);
+            if (ctx.st.volumes.isMuted(uid)) qa.mark(vr, "voice-muted-for-me:{d}", .{uid});
+            if (voiceTip(ctx, vf, uid)) |vt| d.tip(ctx, vr, vt, vh.hovered);
             if (vh.hovered and variant != .tree) d.rect(dl, vr, ctx.col(.hover), ctx.th.radius);
             const live = ctx.st.streamOf(uid) != null or vf.stream or vf.camera;
             // Clicar em quem está na call abre o perfil; se a pessoa está
@@ -372,8 +373,9 @@ fn row(ctx: *d.Ctx, dl: *c.ImDrawList, fam: *d.Family, variant: Variant, cs: any
             if (vh.right) ctx.popup(.{ .menu = .{ .kind = .user, .id = uid, .x = ctx.mouse.x, .y = ctx.mouse.y } });
             switch (variant) {
                 .tree => {
-                    var buf: [80]u8 = undefined;
-                    const t = std.fmt.bufPrint(&buf, "{s}   {s} {s}{s}{s}", .{ if (last) " " else "│", if (speaking) "◉" else "○", u.name, w.botSuffix(u), voiceFlagsTty(vf) }) catch u.name;
+                    var buf: [96]u8 = undefined;
+                    const local = if (ctx.st.volumes.isMuted(uid)) i18n.tr(" [silenciado p/ mim]", " [muted for me]") else "";
+                    const t = std.fmt.bufPrint(&buf, "{s}   {s} {s}{s}{s}{s}", .{ if (last) " " else "│", if (speaking) "◉" else "○", u.name, w.botSuffix(u), voiceFlagsTty(vf), local }) catch u.name;
                     d.text(dl, fam.get(.regular), fs - 2, rr.x + 4, y2 + 2, if (speaking) ctx.col(.online) else ctx.col(.muted), t);
                     if (live) liveBadge(ctx, dl, fam, rr.right() - 4, y2 + 10);
                     y2 += 20;
@@ -383,7 +385,7 @@ fn row(ctx: *d.Ctx, dl: *c.ImDrawList, fam: *d.Family, variant: Variant, cs: any
                     const acy = y2 + 13;
                     if (speaking) c.ImDrawList_AddCircleEx(dl, d.v(ax, acy), 12.5, ctx.col(.online).u(), 0, 2, 0);
                     w.avatar(ctx, dl, ax, acy, 21, uid, .circle, null, 1);
-                    const icons_w = voiceFlagIcons(ctx, dl, vf, vr.right() - 6, acy);
+                    const icons_w = voiceFlagIcons(ctx, dl, vf, uid, vr.right() - 6, acy);
                     if (live) liveBadge(ctx, dl, fam, vr.right() - 6 - icons_w, acy);
                     const vn = d.textClipped(dl, fam.get(.medium), 14, ax + 18, acy - 9, if (speaking) ctx.col(.text) else ctx.col(.muted), u.name, vr.right() - (ax + 18) - icons_w - 6 - w.botTagSpace(ctx, u, false));
                     _ = w.botTag(ctx, dl, ax + 18 + vn, acy, u, false, 1);
@@ -414,9 +416,14 @@ fn badgeWidth(fam: *d.Family, count: u16) f32 {
 }
 
 /// Mudo e surdo de alguém na lista da call; devolve a largura ocupada.
-/// Vermelho quando foi o servidor que impôs.
-fn voiceFlagIcons(ctx: *d.Ctx, dl: *c.ImDrawList, f: ev.VoiceFlags, right: f32, cy: f32) f32 {
+/// Vermelho quando foi o servidor que impôs. O selo de "silenciado para mim"
+/// vem antes dos dois.
+fn voiceFlagIcons(ctx: *d.Ctx, dl: *c.ImDrawList, f: ev.VoiceFlags, uid: Id, right: f32, cy: f32) f32 {
     var x = right;
+    if (ctx.st.volumes.isMuted(uid)) {
+        x -= 16;
+        icons.micMutedForMe(dl, x, cy, ctx.col(.faint).u(), ctx.col(.sidebar).u());
+    }
     if (f.deafened()) {
         x -= 11;
         const col = if (f.deaf) ctx.col(.danger) else ctx.col(.faint);
@@ -458,6 +465,13 @@ fn voiceFlagsTty(f: ev.VoiceFlags) []const u8 {
     if (f.self_deaf) return i18n.tr(" [surdo]", " [deaf]");
     if (f.self_mute) return i18n.tr(" [mudo]", " [mute]");
     return "";
+}
+
+/// O que dizer ao passar o mouse na linha de quem está na call: o silêncio
+/// local ("para mim") tem prioridade sobre o estado do microfone.
+fn voiceTip(ctx: *d.Ctx, f: ev.VoiceFlags, uid: Id) ?[]const u8 {
+    if (ctx.st.volumes.isMuted(uid)) return i18n.tr("Silenciado para você", "Muted for you");
+    return voiceFlagsTip(f);
 }
 
 fn voiceFlagsTip(f: ev.VoiceFlags) ?[]const u8 {
@@ -622,11 +636,9 @@ fn modeLine(ctx: *d.Ctx, buf: []u8) ?[]const u8 {
 }
 
 /// Altura da faixa "Voz conectada" (a lista de canais reserva esse espaço).
-/// Com alguém transmitindo, ganha uma linha para o botão LIVE.
 pub fn voiceBarHeight(ctx: *d.Ctx, tty: bool) f32 {
-    if (tty) return 40;
-    const vc = ctx.st.voice orelse return 74;
-    return if (streamerOf(ctx, vc) != null) 96 else 74;
+    _ = ctx;
+    return if (tty) 40 else 74;
 }
 
 /// O que dizer na última linha da faixa de voz: um problema (em vermelho), ou
@@ -681,33 +693,10 @@ fn signalBars(ctx: *d.Ctx, x: f32, bottom: f32, q: voz.Quality, col: d.Rgba) voi
     }
 }
 
-/// Quem está transmitindo na call (Go Live ou câmera), se alguém estiver.
-fn streamerOf(ctx: *d.Ctx, vc: Id) ?Id {
-    const cs = ctx.store.channel(vc) orelse return null;
-    for (cs.voice_members.items) |uid| {
-        if (ctx.st.streamOf(uid) != null) return uid;
-        const vf = ctx.store.voiceFlags(uid);
-        if (vf.stream or vf.camera) return uid;
-    }
-    return null;
-}
-
 fn voicePanel(ctx: *d.Ctx, fam: *d.Family, r: d.Rect, vc: Id, tty: bool) void {
     const cs = ctx.store.channel(vc) orelse return;
     const g = ctx.store.guild(cs.info.guild);
     const connected = ctx.st.voice_status == .connected;
-    // Quem está transmitindo (Go Live ou câmera): uma linha LIVE na faixa.
-    if (!tty) if (streamerOf(ctx, vc)) |uid| {
-        const lr: d.Rect = .{ .x = r.x + 8, .y = r.y + 49, .w = r.w - 16, .h = 17 };
-        const lh = d.hitRaw(ctx, lr);
-        qa.mark(lr, "voice-live:{d}", .{uid});
-        d.rect(ctx.dl, lr, ctx.col(.danger).alpha(0.92), 4);
-        var lb: [96]u8 = undefined;
-        const label = if (ctx.store.user(uid)) |u| std.fmt.bufPrint(&lb, "● LIVE — {s}", .{u.name}) catch "● LIVE" else "● LIVE";
-        _ = d.textClipped(ctx.dl, fam.get(.bold), 10, lr.x + 7, lr.y + 3, d.Rgba.white, label, lr.w - 12);
-        d.tip(ctx, lr, i18n.tr("Assistir ao stream", "Watch the stream"), lh.hovered);
-        if (lh.clicked) ctx.act(.{ .watch_stream = uid });
-    };
     const ping = ctx.st.voice_ping_ms;
     const q = voz.qualityOf(ping);
     const qcol = switch (q) {
@@ -827,8 +816,7 @@ fn voicePanel(ctx: *d.Ctx, fam: *d.Family, r: d.Rect, vc: Id, tty: bool) void {
     const cx = br.x + 16;
     const cy = br.y + 16;
     const ink = ctx.col(.muted).mix(ctx.col(.danger), k);
-    d.line(ctx.dl, cx - 5, cy - 5, cx + 5, cy + 5, ink, 2.2);
-    d.line(ctx.dl, cx + 5, cy - 5, cx - 5, cy + 5, ink, 2.2);
+    icons.hangup(ctx.dl, cx, cy, 5, ink.u());
     d.tip(ctx, br, i18n.tr("Sair da call", "Leave call"), hb.hovered);
     if (hb.clicked) ctx.act(.leave_voice);
 }
